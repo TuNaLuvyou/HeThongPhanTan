@@ -1,0 +1,11 @@
+{
+  "shared_balance_initial": 10000000,
+  "nodes": [
+    {"id": 0, "ip": "127.0.0.1", "port": 3000, "os": "Windows"},
+    {"id": 1, "ip": "127.0.0.1", "port": 3001, "os": "Windows"},
+    {"id": 2, "ip": "127.0.0.1", "port": 3002, "os": "macOS ARM"},
+    {"id": 3, "ip": "127.0.0.1", "port": 3003, "os": "macOS ARM"},
+    {"id": 4, "ip": "127.0.0.1", "port": 3004, "os": "Linux"},
+    {"id": 5, "ip": "127.0.0.1", "port": 3005, "os": "Linux"}
+  ]
+}
