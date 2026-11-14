@@ -26,11 +26,15 @@ class FakeBank(BankService):
     def _connect(self):
         raise AssertionError("Test khong duoc phep cham DB")
 
-    def deposit(self, node_id, amount):
+    def deposit(self, node_id, amount, before_write=None):
+        if before_write:
+            before_write()
         self._record("DEPOSIT", node_id, amount)
         return not self.fail
 
-    def withdraw(self, node_id, amount):
+    def withdraw(self, node_id, amount, before_write=None):
+        if before_write:
+            before_write()
         self._record("WITHDRAW", node_id, amount)
         return not self.fail
 
@@ -122,6 +126,9 @@ class FakeServer:
     def connect_to_peer(self, peer_id):
         return True
 
+    def peer_ids(self):
+        return sorted(nid for nid in self.cluster.nodes if nid != self.node_id)
+
     def stop(self):
         pass
 
@@ -157,6 +164,7 @@ class Cluster:
             Bully=lambda srv, nid: bully,
             BankService=lambda: bank,
             log_event=lambda *args, **kwargs: None,
+            TRANSACTION_DELAY=0,
         ):
             with mock.patch.object(app_main.sys, "argv", ["main.py", "--id", str(node_id)]):
                 app_main.main()
@@ -197,7 +205,7 @@ class LockFlowTest(unittest.TestCase):
 
     def setUp(self):
         # DONG thoi gian cho de check_pending_timeout chay duoc trong test.
-        patcher = mock.patch.object(app_main, "LOCK_REPLY_TIMEOUT", 0.1)
+        patcher = mock.patch.object(app_main, "REQUEST_REPLY_TIMEOUT", 0.1)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -212,8 +220,8 @@ class LockFlowTest(unittest.TestCase):
         self.assertIsNone(coordinator.bank._lock_holder)
 
         # Node khac phai xin duoc quyen sau do, khong bi nam trong hang doi vo tan.
-        coordinator.dispatch({"type": "REQUEST_LOCK", "from": 3}, 3)
-        self.assertIn((3, {"type": "GRANT_LOCK", "from": 5}), coordinator.server.sent)
+        coordinator.dispatch({"type": "REQUEST", "from": 3}, 3)
+        self.assertIn((3, {"type": "GRANT", "from": 5}), coordinator.server.sent)
 
     def test_lock_moves_between_two_nodes(self):
         """Node 3 nap tien qua coordinator 5: REQUEST -> GRANT -> TX -> RELEASE -> khoa rong."""
@@ -228,7 +236,7 @@ class LockFlowTest(unittest.TestCase):
         self.assertEqual([], coordinator.bank.tx)
 
     def test_second_node_waits_in_fifo_queue(self):
-        """Node 4 xin quyen khi node 3 dang giu: nhan LOCK_QUEUED, roi duoc GRANT_LOCK theo thu tu."""
+        """Node 4 xin quyen khi node 3 dang giu: nhan QUEUED, roi duoc GRANT theo thu tu."""
         cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
@@ -241,7 +249,7 @@ class LockFlowTest(unittest.TestCase):
 
         node4.app.on_deposit(200)
         self.assertTrue(wait_until(lambda: coordinator.bank._lock_queue == [4]))
-        self.assertIn((4, {"type": "LOCK_QUEUED", "from": 5}), coordinator.server.sent)
+        self.assertIn((4, {"type": "QUEUED", "from": 5}), coordinator.server.sent)
 
         gate.set()
         self.assertTrue(wait_until(lambda: node4.bank.tx == [("DEPOSIT", 4, 200)]
@@ -262,8 +270,8 @@ class LockFlowTest(unittest.TestCase):
                                   and coordinator.bank._lock_holder is None))
         self.assertIsNone(coordinator.bank._lock_holder)
 
-        coordinator.dispatch({"type": "REQUEST_LOCK", "from": 4}, 4)
-        self.assertIn((4, {"type": "GRANT_LOCK", "from": 5}), coordinator.server.sent)
+        coordinator.dispatch({"type": "REQUEST", "from": 4}, 4)
+        self.assertIn((4, {"type": "GRANT", "from": 5}), coordinator.server.sent)
 
     def test_demoted_coordinator_clears_lock_state(self):
         """FLOWS muc 3: mat vai tro coordinator thi hang doi cu phai bi xoa sach."""
@@ -316,7 +324,7 @@ class LockFlowTest(unittest.TestCase):
         self.assertTrue(wait_until(lambda: ("coordinator", "6") in node3.app.events))
         self.assertFalse(any("Huỷ giao dịch đang chờ" in line for line in node3.app.logs()))
 
-        coordinator6.dispatch({"type": "RELEASE_LOCK", "from": 9}, 9)
+        coordinator6.dispatch({"type": "RELEASE", "from": 9}, 9)
         self.assertTrue(wait_until(lambda: node3.bank.tx == [("DEPOSIT", 3, 100)]))
 
     def test_orphan_grant_releases_lock_immediately(self):
@@ -328,25 +336,25 @@ class LockFlowTest(unittest.TestCase):
         coordinator.bank._lock_holder = 3
         coordinator.bank._lock_queue = [4]
 
-        node3.dispatch({"type": "GRANT_LOCK", "from": 5}, 5)
+        node3.dispatch({"type": "GRANT", "from": 5}, 5)
 
-        self.assertIn((5, {"type": "RELEASE_LOCK", "from": 3}), node3.server.sent)
+        self.assertIn((5, {"type": "RELEASE", "from": 3}), node3.server.sent)
         # RELEASE that quay ve coordinator nen hang doi duoc tiep tuc phuc vu.
         self.assertEqual(4, coordinator.bank._lock_holder)
-        self.assertIn((4, {"type": "GRANT_LOCK", "from": 5}), coordinator.server.sent)
+        self.assertIn((4, {"type": "GRANT", "from": 5}), coordinator.server.sent)
 
     def test_unreachable_coordinator_triggers_election(self):
-        """Gui REQUEST_LOCK that bai (coordinator da tat) thi phai bau lai, khong choi im lang."""
+        """Gui REQUEST that bai (coordinator da tat) thi phai bau lai, khong choi im lang."""
         cluster = self.make_cluster()
         cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
         node3.server.down_peers.add(5)
 
         node3.app.on_deposit(100)
-        self.assertEqual(["REQUEST_LOCK_SEND_FAIL"], node3.bully.elections)
+        self.assertEqual(["REQUEST_SEND_FAIL"], node3.bully.elections)
 
     def test_silent_coordinator_triggers_election(self):
-        """FLOWS muc 2b: REQUEST_LOCK khong co phan hoi thi bau lai."""
+        """FLOWS muc 2b: REQUEST khong co phan hoi thi bau lai."""
         cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
@@ -354,7 +362,7 @@ class LockFlowTest(unittest.TestCase):
         coordinator.server.handler = None
 
         node3.app.on_deposit(100)
-        self.assertTrue(wait_until(lambda: "REQUEST_LOCK_NO_REPLY" in node3.bully.elections, timeout=8.0))
+        self.assertTrue(wait_until(lambda: "REQUEST_NO_REPLY" in node3.bully.elections, timeout=8.0))
         self.assertTrue(any("không phản hồi" in line for line in node3.app.logs()))
 
 

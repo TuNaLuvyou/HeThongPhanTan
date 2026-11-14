@@ -7,7 +7,7 @@ tới các node khác). Giao thức truyền tin:
     Mỗi gói tin là một chuỗi JSON trên một dòng, kết thúc bằng ký tự '\n'.
 
 File này chỉ lo việc gửi/nhận byte và đóng gói JSON. Việc hiểu nội dung gói
-tin (ELECTION, REQUEST_LOCK, ...) thuộc về core/bully.py và main.py.
+tin (ELECTION, REQUEST, ...) thuộc về core/bully.py và main.py.
 
 Quy ước định danh node gửi: lấy trường `from` trong gói tin, KHÔNG suy ra từ
 địa chỉ IP. Nhiều node có thể chạy chung một máy nên IP bị trùng nhau.
@@ -93,9 +93,9 @@ EVENT_LABELS = {
     "IGNORE_AFTER_STOP": "Bỏ qua thông báo sau khi dừng",
     "STEP_DOWN": "Nhường vai trò điều phối viên",
     "FOLLOW_COORDINATOR": "Đã nhận điều phối viên",
-    "LOCK_GRANTED": "Đã cấp quyền",
-    "LOCK_QUEUED": "Đang xếp hàng chờ quyền",
-    "LOCK_RESET": "Đã xoá trạng thái khoá",
+    "GRANTED": "Đã cấp quyền",
+    "QUEUED": "Đang xếp hàng chờ quyền",
+    "ACCESS_RESET": "Đã xoá trạng thái khoá",
     "DEPOSIT_INVALID": "Số tiền nạp không hợp lệ",
     "DEPOSIT_OK": "Nạp tiền thành công",
     "WITHDRAW_INVALID": "Số tiền rút không hợp lệ",
@@ -252,6 +252,27 @@ class NetworkServer:
         self._connections: set = set()
         self._lock = threading.Lock()
         self._handler = None
+        # Chỉ chứa các thành viên đã trao đổi JOIN, không lấy từ config.
+        self._peers: dict = {}
+        self._connecting: set = set()
+
+    def peer_ids(self) -> list:
+        """Các ID đã được phát hiện trong lúc chạy."""
+        with self._lock:
+            return sorted(self._peers)
+
+    def _membership(self) -> list:
+        with self._lock:
+            return [dict(peer) for peer in self._peers.values()]
+
+    def _join_message(self, message_type: str) -> dict:
+        return {"type": message_type, "from": self.node_id,
+                "node": {"id": self.node_id, "ip": self.host, "port": self.port},
+                "peers": self._membership()}
+
+    def join(self, host: str, port: int) -> bool:
+        """Gia nhập qua một địa chỉ đã biết; không quét danh sách cấu hình."""
+        return self._connect_address(host, port)
 
     def set_message_handler(self, handler: Callable) -> None:
         """Đăng ký hàm xử lý gói tin.
@@ -271,6 +292,7 @@ class NetworkServer:
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind((self.host, self.port))
             server_socket.listen(10)
+            self.port = server_socket.getsockname()[1]
             server_socket.settimeout(1.0)
 
             self._server_socket = server_socket
@@ -302,22 +324,51 @@ class NetworkServer:
             self._clients.clear()
 
     def connect_to_peer(self, peer_id: int) -> bool:
-        """Chủ động mở kết nối tới một peer và bắt đầu lắng nghe phản hồi."""
-        peer_config = get_node_config(peer_id)
-        host = peer_config.get("ip", DEFAULT_HOST)
-        port = int(peer_config.get("port", 3000 + peer_id))
+        """Kết nối lại tới thành viên đã phát hiện, khi cần gửi thông điệp."""
+        with self._lock:
+            if peer_id in self._clients:
+                return True
+            peer_config = self._peers.get(peer_id)
+        if peer_config is None:
+            return False
+        return self._connect_address(peer_config["ip"], peer_config["port"], peer_id)
+
+    def _connect_address(self, host: str, port: int, peer_id=None) -> bool:
+        address = (host, port)
+        with self._lock:
+            if not self._running or address in self._connecting:
+                return False
+            if peer_id in self._clients:
+                return True
+            self._connecting.add(address)
+        try:
+            return self._open_connection(host, port, peer_id)
+        finally:
+            with self._lock:
+                self._connecting.discard(address)
+
+    def _open_connection(self, host: str, port: int, peer_id) -> bool:
 
         conn = ClientConnection((host, port), timeout=self.timeout)
         if not conn.connect(host, port):
-            log_event(self.node_id, "CONNECT_FAILED", f"Không kết nối được tới nút {peer_id}")
+            log_event(self.node_id, "CONNECT_FAILED", f"Không kết nối được tới {host}:{port}")
             return False
 
         with self._lock:
             if not self._running:
                 conn.close()
                 return False
-            self._clients[peer_id] = conn
+            if peer_id is not None:
+                self._clients.setdefault(peer_id, conn)
             self._connections.add(conn)
+
+        if not conn.send(self._join_message("JOIN")):
+            conn.close()
+            with self._lock:
+                self._connections.discard(conn)
+                if self._clients.get(peer_id) is conn:
+                    self._clients.pop(peer_id, None)
+            return False
 
         listen_thread = threading.Thread(
             target=self._listen_loop,
@@ -325,7 +376,7 @@ class NetworkServer:
             daemon=True,
         )
         listen_thread.start()
-        log_event(self.node_id, "CLIENT_CONNECTED", f"Kết nối tới nút {peer_id}")
+        log_event(self.node_id, "CLIENT_CONNECTED", f"Kết nối tới {host}:{port}")
         return True
 
     def send(self, peer_id: int, payload: dict) -> bool:
@@ -334,14 +385,47 @@ class NetworkServer:
             conn = self._clients.get(peer_id)
 
         if conn is None:
-            return False
+            if not self.connect_to_peer(peer_id):
+                return False
+            with self._lock:
+                conn = self._clients.get(peer_id)
+            if conn is None:
+                return False
 
         sent = conn.send(payload)
         if not sent:
             # Kết nối đã chết: bỏ khỏi danh sách để lần sau không dùng lại.
             with self._lock:
-                self._clients.pop(peer_id, None)
+                if self._clients.get(peer_id) is conn:
+                    self._clients.pop(peer_id, None)
+            if self.connect_to_peer(peer_id):
+                with self._lock:
+                    replacement = self._clients.get(peer_id)
+                return replacement is not None and replacement.send(payload)
         return sent
+
+    def _handle_join(self, message: dict, conn: ClientConnection) -> None:
+        """Trao địa chỉ thành viên, rồi nối tới các thành viên chưa gặp."""
+        node = message.get("node", {})
+        if node.get("id") != message.get("from"):
+            raise ValueError("ID trong JOIN không khớp người gửi")
+        members = [node] + message.get("peers", [])
+        to_connect = []
+        with self._lock:
+            for member in members:
+                member_id = int(member["id"])
+                host, port = str(member["ip"]), int(member["port"])
+                if not host or not 0 < port < 65536:
+                    raise ValueError("Địa chỉ JOIN không hợp lệ")
+                if member_id == self.node_id:
+                    continue
+                self._peers[member_id] = {"id": member_id, "ip": host, "port": port}
+                if member_id not in self._clients:
+                    to_connect.append(member_id)
+        if message["type"] == "JOIN":
+            conn.send(self._join_message("JOIN_ACK"))
+        for member_id in to_connect:
+            threading.Thread(target=self.connect_to_peer, args=(member_id,), daemon=True).start()
 
     # -- Vòng lặp nội bộ ----------------------------------------------------
 
@@ -364,8 +448,8 @@ class NetworkServer:
                     break
                 self._connections.add(conn)
 
-            peer_id = self._resolve_peer_id(addr)
-            log_event(self.node_id, "CLIENT_CONNECTED", f"Nhận kết nối từ {addr[0]}:{addr[1]}; nút dự đoán: {peer_id}")
+            peer_id = None
+            log_event(self.node_id, "CLIENT_CONNECTED", f"Nhận kết nối từ {addr[0]}:{addr[1]}")
 
             listen_thread = threading.Thread(
                 target=self._listen_loop,
@@ -374,24 +458,10 @@ class NetworkServer:
             )
             listen_thread.start()
 
-    def _resolve_peer_id(self, addr: tuple) -> Optional[int]:
-        """Đoán id của peer dựa trên IP, CHỈ để ghi log.
-
-        Không dùng giá trị này để định danh node gửi: nhiều node chạy chung
-        một máy sẽ có cùng IP, còn port nguồn là port ngẫu nhiên do hệ điều
-        hành cấp. Định danh thật nằm ở trường `from` của gói tin.
-        """
-        config = load_config()
-        for node_config in config.get("nodes", []):
-            if node_config.get("ip") == addr[0]:
-                return int(node_config.get("id"))
-        return None
-
     def _listen_loop(self, peer_id: Optional[int], conn: ClientConnection) -> None:
         """Đọc gói tin trên một kết nối và chuyển cho handler.
 
-        peer_id ban đầu có thể là None hoặc đoán từ IP. Khi gói tin có trường
-        `from` thì dùng trường đó làm id chính thức của node gửi.
+        peer_id ban đầu có thể là None. Trường `from` định danh node gửi.
         """
         try:
             while self._running:
@@ -416,6 +486,8 @@ class NetworkServer:
                     continue
 
                 try:
+                    if message.get("type") in ("JOIN", "JOIN_ACK"):
+                        self._handle_join(message, conn)
                     self._handler(self.node_id, message, peer_id, conn)
                 except Exception as exc:
                     log_event(self.node_id, "HANDLER_ERROR", str(exc))

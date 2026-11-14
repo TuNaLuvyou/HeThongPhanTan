@@ -1,10 +1,9 @@
 # ui/app_window.py - Thành viên 5 (Windows 1)
 """Giao diện Tkinter của một node.
 
-Cửa sổ gồm ba phần:
-- Header    : vai trò hiện tại, ID coordinator, số dư quỹ.
-- Nạp/Rút   : ô nhập số tiền và hai nút thao tác.
-- Nhật ký hoạt động: nhật ký bầu chọn, xin/cấp/trả quyền và giao dịch.
+Cửa sổ gồm hai cột:
+- Bên trái: nhật ký bầu chọn, xin/cấp/trả quyền và giao dịch, cuộn dọc.
+- Bên phải: vai trò, coordinator, số dư, nạp/rút và đếm ngược giao dịch.
 
 Lưu ý về thread: Tkinter chỉ được cập nhật từ luồng chính. Các luồng mạng
 hoặc luồng nền không gọi trực tiếp widget, mà đẩy sự kiện vào `_event_queue`
@@ -28,8 +27,8 @@ class AppWindow:
         self.root = root
         self.node_id = node_id
         self.root.title(f"Quỹ chung phân tán - Nút {node_id}")
-        self.root.geometry("900x740")
-        self.root.minsize(760, 640)
+        self.root.geometry("1100x740")
+        self.root.minsize(1000, 640)
         self.root.configure(background="#F5F6F8")
         self._font = tkfont.nametofont("TkDefaultFont").actual("family")
         self._log_count = 0
@@ -81,8 +80,16 @@ class AppWindow:
             borderwidth=0, arrowsize=12,
         )
 
-        self.content = tk.Frame(self.root, background="#F5F6F8", padx=28, pady=24)
-        self.content.pack(fill=tk.BOTH, expand=True)
+        layout = tk.Frame(self.root, background="#F5F6F8", padx=28, pady=24)
+        layout.pack(fill=tk.BOTH, expand=True)
+        layout.rowconfigure(0, weight=1)
+        layout.columnconfigure(0, weight=1, minsize=300)
+        layout.columnconfigure(1, weight=2, minsize=580)
+
+        self.log_column = tk.Frame(layout, background="#F5F6F8")
+        self.log_column.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
+        self.content = tk.Frame(layout, background="#F5F6F8")
+        self.content.grid(row=0, column=1, sticky="nsew")
         self._build_header()
         self._build_action_area()
         self._build_log_area()
@@ -152,30 +159,37 @@ class AppWindow:
         controls.columnconfigure(0, weight=1)
         self.amount_entry = ttk.Entry(controls, style="Fund.TEntry", width=16, font=(self._font, 14))
         self.amount_entry.grid(row=0, column=0, sticky="ew", padx=(0, 12))
-        ttk.Button(
+        self.deposit_button = ttk.Button(
             controls, text="Nạp tiền", style="Deposit.Fund.TButton", command=self._handle_deposit,
-        ).grid(row=0, column=1, padx=(0, 8))
-        ttk.Button(
+        )
+        self.deposit_button.grid(row=0, column=1, padx=(0, 8))
+        self.withdraw_button = ttk.Button(
             controls, text="Rút tiền", style="Fund.TButton", command=self._handle_withdraw,
-        ).grid(row=0, column=2)
+        )
+        self.withdraw_button.grid(row=0, column=2)
         self._label(
             action_frame, "Nhập số nguyên dương, ví dụ: 100000", size=10, color="#697586",
         ).pack(anchor="w", pady=(9, 0))
+        self.transaction_status_var = tk.StringVar(value="Sẵn sàng giao dịch")
+        self._label(
+            action_frame, size=11, color="#176B54", bold=True,
+            textvariable=self.transaction_status_var, wraplength=520,
+        ).pack(anchor="w", pady=(12, 0))
 
     def _build_log_area(self) -> None:
-        """Khu vực Nhật ký hoạt động."""
-        log_header = tk.Frame(self.content, background="#F5F6F8")
+        """Cột nhật ký bên trái, kéo dài theo chiều cao cửa sổ."""
+        log_header = tk.Frame(self.log_column, background="#F5F6F8")
         log_header.pack(fill=tk.X, pady=(0, 10))
         self._label(log_header, "Nhật ký hoạt động", size=13, bold=True).pack(side=tk.LEFT)
         self.log_count_var = tk.StringVar(value="0 sự kiện")
         self._label(log_header, size=10, color="#697586", textvariable=self.log_count_var).pack(side=tk.RIGHT)
 
         log_frame = tk.Frame(
-            self.content, background="#FFFFFF", highlightbackground="#E2E7EC", highlightthickness=1,
+            self.log_column, background="#FFFFFF", highlightbackground="#E2E7EC", highlightthickness=1,
         )
         log_frame.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(
-            log_frame, height=9, state=tk.DISABLED, wrap=tk.WORD,
+            log_frame, width=30, height=1, state=tk.DISABLED, wrap=tk.WORD,
             background="#FFFFFF", foreground="#435469", font=(self._font, 10),
             borderwidth=0, highlightthickness=0, padx=16, pady=12,
             spacing1=3, spacing3=7, selectbackground="#DDEDE7", selectforeground="#172B3A",
@@ -202,6 +216,8 @@ class AppWindow:
             "role"        - cập nhật vai trò (Node/Coordinator).
             "coordinator" - cập nhật ID coordinator.
             "balance"     - cập nhật số dư.
+            "transaction_status" - trạng thái chờ/đếm ngược/kết quả giao dịch.
+            "transaction_busy"   - khoá/mở hai nút giao dịch trên node này.
         """
         self._event_queue.put((kind, payload))
 
@@ -228,6 +244,12 @@ class AppWindow:
         elif kind == "balance":
             self.balance_var.set(str(payload))
             self.updated_var.set(f"Cập nhật lúc {datetime.now():%H:%M:%S}")
+        elif kind == "transaction_status":
+            self.transaction_status_var.set(str(payload))
+        elif kind == "transaction_busy":
+            state = "disabled" if payload else "normal"
+            self.deposit_button.configure(state=state)
+            self.withdraw_button.configure(state=state)
 
     def _append_log(self, line: str) -> None:
         """Thêm một dòng vào cuối Nhật ký hoạt động."""

@@ -13,20 +13,20 @@ Trỏ tới thư mục `docs/` để xem chi tiết.
 - **Khởi tạo và kích hoạt môi trường ảo (venv)**:
   - Tạo môi trường ảo:
     ```bash
-    python -m venv .venv
+    python -m venv venv
     ```
   - Kích hoạt môi trường ảo:
     - **Windows (PowerShell)**:
       ```powershell
-      .\.venv\Scripts\Activate.ps1
+      .\venv\Scripts\Activate.ps1
       ```
     - **Windows (Command Prompt)**:
       ```cmd
-      .\.venv\Scripts\activate.bat
+      .\venv\Scripts\activate.bat
       ```
     - **macOS / Linux**:
       ```bash
-      source .venv/bin/activate
+      source venv/bin/activate
       ```
 - **Cài đặt thư viện**:
   ```bash
@@ -51,17 +51,29 @@ python main.py --id <node_id>
 Trong đó `<node_id>` từ `0` đến `5`.
 Không cần nhập port hay bấm mở server trên UI, hệ thống tự gán port theo ID từ `config.json`.
 
+Node đầu tiên chạy một mình và tự làm điều phối viên ngay. Node tiếp theo gia nhập qua **một địa chỉ đang chạy**, không cần biết trước toàn bộ thành viên:
+
+```bash
+python main.py --id 2 --join 10.130.28.217:3000
+```
+
+`--join` có thể trỏ tới node thường hoặc điều phối viên. Các node trao đổi ID, IP và port bằng `JOIN`/`JOIN_ACK`, rồi kết nối với các thành viên được giới thiệu. Không có `--join` thì node khởi tạo nhóm riêng. Nếu điểm gia nhập chưa mở, node thử lại mỗi 5 giây trong nền.
+
+Khi dùng chung DB, các node cần gia nhập cùng nhóm và chờ thống nhất điều phối viên trước khi giao dịch. Các node mở riêng không có điều phối viên chung.
+
 ### Thử hai máy qua ZeroTier
 
 1. Các máy tham gia cùng mạng ZeroTier và được duyệt thiết bị.
-2. Trong `config.json`, điền **IP ZeroTier của từng máy**, không điền Network ID hay Public IP. Chép cùng cấu hình sang tất cả các máy và cho phép Python nhận kết nối qua firewall.
+2. Trong `config.json`, điền **IP ZeroTier và port của chính máy đang chạy**, không điền Network ID hay Public IP. Mỗi máy chỉ cần mục cấu hình của ID mình; các mục khác nếu có không được quét khi khởi động. Cho phép Python nhận kết nối qua firewall.
 3. Cấu hình hiện tại dành cho Windows node `0` (`10.130.28.217:3000`) và macOS node `2` (`10.130.28.199:3002`). Các node còn lại đang dùng localhost, cần đổi IP trước khi chạy thêm máy.
-4. Windows chạy `python main.py --id 0`; macOS chạy `python3 main.py --id 2` (hoặc `python` nếu đã kích hoạt venv).
+4. Windows chạy `python main.py --id 0`; macOS chạy `python3 main.py --id 2 --join 10.130.28.217:3000` (hoặc `python` nếu đã kích hoạt venv). Nếu Mac mở trước thì Windows dùng `--join 10.130.28.199:3002`.
 5. Khi cả hai cùng hoạt động và kết nối thông suốt, hai giao diện phải cùng hiển thị điều phối viên `2`.
 
-Node thử kết nối các peer trong nền trước khi bắt đầu bầu chọn nên giao diện vẫn phản hồi. Node có ID lớn nhất còn hoạt động làm điều phối viên; node mới khởi động cũng tham gia bầu chọn.
+Node bật Bully ngay, không thử kết nối danh sách cấu hình và không chờ đủ máy. Node có ID lớn nhất trong nhóm đã kết nối làm điều phối viên; node mới gia nhập được so ID để thống nhất vai trò.
 
 Giao diện dùng Tkinter/ttk với tiếng Việt có dấu: số dư quỹ, vai trò hiện tại, nhập tiền nạp/rút và nhật ký có thời gian. Sau giao dịch thành công, các node khác nhận thông báo TCP và đọc lại số dư từ DB. Thông báo này không được lưu để phát lại khi máy mất kết nối.
+
+Nạp/rút mặc định chờ mô phỏng **3 giây sau khi đọc số dư, trước khi ghi DB**, hiển thị đếm ngược trên giao diện để quan sát người giữ quyền và FIFO. Node đang xếp hàng chỉ hiện chờ quyền; khi được cấp mới bắt đầu đếm. Hai nút giao dịch của node đang chờ/đang chạy được vô hiệu hoá; giao diện và các node khác vẫn hoạt động. Đổi `TRANSACTION_DELAY` trong `main.py` nếu cần thời gian khác, hoặc đặt `0` để tắt. Mutex nội bộ chỉ bảo vệ trạng thái cấp quyền, không giữ trong thời gian mô phỏng.
 
 ### Kiểm thử
 
@@ -69,7 +81,7 @@ Giao diện dùng Tkinter/ttk với tiếng Việt có dấu: số dư quỹ, va
 python -m unittest discover -s tests
 ```
 
-Trên macOS ngoài venv, dùng `python3`. Bộ test hiện có **37 test**, không yêu cầu DB thật hay mở cửa sổ. Xem [kịch bản kiểm thử](docs/TESTING.md) để thử giao diện, DB và ZeroTier; xem [giao thức](docs/TECHS.md) và [luồng hoạt động](docs/FLOWS.md) để hiểu cách xử lý.
+Trên macOS ngoài venv, dùng `python3`. Bộ test hiện có **53 test**, không yêu cầu DB thật hay mở cửa sổ, gồm kiểm thử nhiều luồng xin/trả quyền và đếm ngược trước khi ghi DB. Xem [kịch bản kiểm thử](docs/TESTING.md) để thử giao diện, DB và ZeroTier; xem [giao thức](docs/TECHS.md) và [luồng hoạt động](docs/FLOWS.md) để hiểu cách xử lý.
 
 Để chỉ xem giao diện, không kết nối DB hay mạng:
 
@@ -78,6 +90,22 @@ python -m ui.app_window
 ```
 
 Chế độ xem riêng giao diện chỉ ghi nhận thao tác mẫu, không thực hiện giao dịch thật. Hệ thống chưa thu hồi khoá khi node giữ quyền bị crash; cần tránh tình huống này trong demo thông thường hoặc kiểm thử riêng theo tài liệu.
+
+### Cấu trúc thư mục
+
+```text
+core/             TCP và thành viên mạng, Bully, cấp quyền FIFO và truy cập DB
+ui/               Giao diện Tkinter
+db/schema.sql     Lược đồ và dữ liệu khởi tạo
+tests/            Kiểm thử tự động
+docs/             Nghiệp vụ, giao thức, luồng và hướng dẫn kiểm thử
+main.py           Khởi động và ghép các module
+config.json       Cấu hình node
+requirements.txt  Thư viện cần cài
+.env.example      Mẫu cấu hình kết nối DB
+```
+
+`venv/` là môi trường Python cục bộ. `logs/` và `__pycache__/` tự tạo lại khi chạy, được bỏ qua trong Git và có thể dọn khi không cần dữ liệu cũ. Script tạo PR, nội dung PR cũ và script smoke UI tạm trong `logs/` đã được dọn; các lệnh chạy ứng dụng và unittest không phụ thuộc các file này.
 
 ## 4. Phân công thành viên
 

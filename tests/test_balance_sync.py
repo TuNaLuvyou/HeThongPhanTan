@@ -28,7 +28,8 @@ class BalanceSyncTest(unittest.TestCase):
             app = FakeAppWindow(FakeRoot(), node_id)
             bank = FakeBank()
             bully = FakeBully(server, node_id, coordinator=5)
-            runtime = NodeRuntime(FakeRoot(), node_id, CONFIG, server, app, bank, bully)
+            runtime = NodeRuntime(FakeRoot(), node_id, CONFIG, server, app, bank, bully,
+                                  transaction_delay=0)
             server.set_message_handler(runtime.on_message)
             self.runtimes[node_id] = runtime
             self.cluster.nodes[node_id] = _Node(node_id, server, app, bank, bully)
@@ -61,7 +62,7 @@ class BalanceSyncTest(unittest.TestCase):
 
                 targets = [peer for peer, payload in sender.server.sent
                            if payload["type"] == "BALANCE_CHANGED"]
-                self.assertEqual([4, 5, 6], targets)
+                self.assertEqual([4, 5], targets)
                 self.assertEqual([], receiver.server.sent)  # Không phát lại thông báo.
 
     def test_rejected_or_failed_transaction_does_not_broadcast(self):
@@ -96,6 +97,7 @@ class BalanceSyncTest(unittest.TestCase):
         sender = self.runtimes[3]
         sender.config = {"nodes": [{"id": 3}, {"id": 4}]}
         with mock.patch.object(sender.server, "send", side_effect=[False, True]) as send, \
+                mock.patch.object(sender.server, "peer_ids", return_value=[4]), \
                 mock.patch.object(sender.server, "connect_to_peer", return_value=True) as connect:
             sender._broadcast_balance_changed()
         connect.assert_called_once_with(4)
