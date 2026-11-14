@@ -24,6 +24,8 @@
 - `config.json` liệt kê 6 node (`id`, `ip`, `port`, `os`).
 - Port của node = giá trị trong config theo `--id`, tự bind khi khởi động.
 - Bind port thất bại (port đã bị chiếm hoặc IP trong `config.json` không phải IP máy đang chạy) thì `start_node()` trả `None` và node thoát ngay kèm thông báo lỗi; không mở giao diện chạy mà không có kết nối.
+- Sau khi đăng ký handler và mở UI, node thử kết nối các peer song song trong nền; chỉ khởi động Bully sau khi các lần thử hoàn tất. Peer offline không ngăn node bầu chọn và không cộng dồn thời gian chờ kết nối.
+- Kết nối nhận được định danh bằng `from` cũng được dùng làm đường gửi ngược nếu chưa có đường gửi tới peer, hỗ trợ node tham gia sau khi coordinator đã chạy.
 
 ## 5. Giao thức
 - Mỗi gói tin là một chuỗi JSON trên một dòng, kết thúc bằng `\n`.
@@ -40,6 +42,7 @@
 - `GRANT_LOCK`
 - `LOCK_QUEUED`
 - `RELEASE_LOCK`
+- `BALANCE_CHANGED`: nút vừa giao dịch thành công gửi trực tiếp tới các nút khác để cập nhật số dư giao diện.
 - `LOCK_QUEUED` là loại mới so với danh sách đã chốt ở mục 8: coordinator trả cho node vừa bị đưa vào hàng đợi FIFO ("đã nhận đơn, đang xếp hàng"), để node xin quyền phân biệt "đang chờ tới lượt" với "coordinator đã chết" (FLOWS mục 2b). `GRANT_LOCK` và `LOCK_QUEUED` đều được tính là "coordinator có phản hồi".
 - **Cấu trúc trường của từng loại** (đang ở trạng thái CẦN CHỐT — xem 9a): bảng dưới đây là đề xuất theo đúng code đang phát, cần cả nhóm họp xác nhận chứ chưa chốt một mình.
 
@@ -54,6 +57,16 @@
 | `GRANT_LOCK` | `{"type": "GRANT_LOCK", "from": 4}` | Coordinator → node được cấp quyền |
 | `LOCK_QUEUED` | `{"type": "LOCK_QUEUED", "from": 4}` | Coordinator → node vừa được đưa vào hàng đợi FIFO |
 | `RELEASE_LOCK` | `{"type": "RELEASE_LOCK", "from": 2}` | Node đang giữ quyền → coordinator |
+| `BALANCE_CHANGED` | `{"type": "BALANCE_CHANGED", "from": 2}` | Nút vừa commit giao dịch thành công → các nút khác trong cấu hình |
+
+### Đồng bộ số dư giao diện
+- Chỉ gửi `BALANCE_CHANGED` sau khi giao dịch thành công và đã trả khoá; giao dịch bị từ chối hoặc phát sinh lỗi không gửi thông báo.
+- Nút nhận đọc lại số dư từ DB trong luồng nền và đưa kết quả vào hàng đợi giao diện. Không phát lại thông báo, không thực hiện lại giao dịch, không dùng số dư do nút gửi cung cấp.
+- Các lần đọc số dư giao diện dùng kết nối DB riêng và được xử lý tuần tự tại mỗi nút, tránh dùng chung phiên ghi giao dịch và tránh kết quả cũ ghi đè kết quả mới.
+- Thông báo được gửi cố gắng tới từng nút; nếu gửi thất bại thì thử kết nối và gửi lại một lần. Không hoàn tác giao dịch đã commit khi nút khác offline. Chưa lưu thông báo để phát lại; nút mở lại ứng dụng sẽ đọc số dư hiện tại từ DB.
+- Kết nối TCP tiếp tục chờ qua các lần timeout khi rảnh. Mỗi kết nối tuần tự hoá các lần gửi để heartbeat và thông báo số dư không xen lẫn byte.
+- Nội dung log và nhãn giao diện sử dụng tiếng Việt có dấu; mã gói tin, mã sự kiện nội bộ và tên cột DB giữ nguyên.
+- Đây là thông báo qua TCP của ứng dụng, không sử dụng Supabase Realtime hay Socket.IO. Các node cần chạy cùng bản mã nguồn để xử lý thông báo mới.
 
 ## 7. CSDL (đề xuất lược đồ)
 - Bảng `fund` (`id`, `balance bigint`, `updated_at`): có một dòng duy nhất.
@@ -61,6 +74,15 @@
 - Kết nối qua Supabase Shared pooler chế độ session (cổng 5432) vì mạng nhà có thể chỉ có IPv4.
 - Project free của Supabase bị tạm dừng sau khoảng 7 ngày không hoạt động, cần kiểm tra trước buổi demo.
 - Chuỗi kết nối lưu trong `.env`, không commit.
+- `BankService(database_url=...)` ưu tiên chuỗi được truyền trực tiếp, sau đó tới biến môi trường `DATABASE_URL`, cuối cùng đọc `DATABASE_URL` trong `.env` ở gốc dự án. Không cần thư viện dotenv.
+
+### Giao diện và log
+
+- Tkinter/ttk, theme `clam`, dùng phông hệ thống; không thêm thư viện giao diện bên ngoài.
+- Bố cục gồm số dư, vai trò/điều phối viên, nhập số tiền và nhật ký. Thời điểm cập nhật số dư là lúc giao diện nhận kết quả đọc DB, không phải thời gian commit giao dịch.
+- Luồng nền chỉ gửi sự kiện qua `post_event()`; Tkinter xử lý hàng đợi ở luồng chính.
+- Nhật ký giao diện có giờ và màu theo thông báo. Log file `logs/node_<id>.log` lưu UTF-8, log terminal dùng UTF-8 để tránh lỗi mã hoá tiếng Việt trên Windows.
+- Hướng dẫn và giới hạn kiểm thử nằm trong [TESTING.md](TESTING.md).
 
 ## 8. ĐÃ CHỐT
 - Python + Tkinter.

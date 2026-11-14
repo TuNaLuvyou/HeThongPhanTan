@@ -11,7 +11,7 @@ Trình tự khởi động:
     1. Đọc tham số --id và tìm cấu hình node trong config.json.
     2. Mở server TCP (bind port theo cấu hình).
     3. Mở cửa sổ Tkinter.
-    4. Chạy các dịch vụ nền: Bully, kết nối tới các peer, vòng cập nhật.
+    4. Kết nối tới các peer trong nền, sau đó mới bắt đầu Bully.
     5. Chờ người dùng bấm Nạp/Rút.
 
 Cách chạy:
@@ -24,6 +24,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.bank_service import BankService
 from core.bully import Bully
@@ -94,6 +95,8 @@ class NodeRuntime:
 
         # Bảo vệ ba biến _pending_* vì chúng bị nhiều thread cùng đọc/ghi.
         self._pending_lock = threading.Lock()
+        self._balance_refresh_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._pending_type = None
         self._pending_amount = 0
         self._pending_sent_at = None
@@ -107,12 +110,11 @@ class NodeRuntime:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Gắn callback, bật Bully và chạy các luồng nền."""
+        """Gắn callback, kết nối các peer rồi bật Bully trong luồng nền."""
         self.app.on_deposit = lambda amount: self.request_transaction("DEPOSIT", amount)
         self.app.on_withdraw = lambda amount: self.request_transaction("WITHDRAW", amount)
 
         self.server.set_message_handler(self.on_message)
-        self.bully.start()
 
         connect_thread = threading.Thread(target=self._connect_peers, daemon=True)
         connect_thread.start()
@@ -122,7 +124,8 @@ class NodeRuntime:
 
     def shutdown(self) -> None:
         """Dừng mọi dịch vụ và đóng cửa sổ."""
-        self._ui_log("Dang dung node...")
+        self._stop_event.set()
+        self._ui_log("Đang dừng nút...")
 
         try:
             self.bully.stop()
@@ -134,22 +137,34 @@ class NodeRuntime:
         self.root.destroy()
 
     def _connect_peers(self) -> None:
-        """Chờ server sẵn sàng rồi nối tới tất cả các peer trong config."""
-        time.sleep(0.5)
+        """Thử kết nối mọi peer trước khi khởi động cuộc bầu chọn đầu tiên."""
+        if self._stop_event.is_set():
+            return
+        peer_ids = [int(node["id"]) for node in self.config.get("nodes", [])
+                    if int(node["id"]) != self.node_id]
+        self._ui_log("Đang kết nối các nút trước khi bầu chọn...")
+        # Thử song song để các máy offline không cộng dồn thời gian chờ.
+        with ThreadPoolExecutor(max_workers=max(1, len(peer_ids))) as pool:
+            attempts = {pool.submit(self.server.connect_to_peer, peer_id): peer_id
+                        for peer_id in peer_ids}
+            for attempt in as_completed(attempts):
+                try:
+                    attempt.result()
+                except Exception as exc:
+                    self._ui_log(f"Không kết nối được tới nút {attempts[attempt]}: {exc}")
 
-        for node_config in self.config.get("nodes", []):
-            peer_id = int(node_config.get("id"))
-            if peer_id != self.node_id:
-                self.server.connect_to_peer(peer_id)
-
-        time.sleep(0.5)
+        if self._stop_event.is_set():
+            return
+        self._ui_log("Đã thử kết nối các nút, bắt đầu bầu chọn điều phối viên")
+        self.bully.start()
+        if self._stop_event.is_set():
+            return
         self.update_status()
         self.refresh_balance_async()
 
     def _periodic_update(self) -> None:
         """Vòng nền cập nhật giao diện và kiểm tra coordinator còn sống."""
-        while True:
-            time.sleep(STATUS_UPDATE_INTERVAL)
+        while not self._stop_event.wait(STATUS_UPDATE_INTERVAL):
             try:
                 self.update_status()
                 self._check_pending_timeout()
@@ -168,14 +183,14 @@ class NodeRuntime:
     def update_status(self) -> None:
         """Đẩy vai trò, coordinator và kiểm tra đổi coordinator lên UI."""
         if self.bully.is_coordinator():
-            role = "Coordinator"
+            role = "Điều phối viên"
         else:
-            role = "Node binh thuong"
+            role = "Nút bình thường"
         self.app.post_event("role", role)
 
         coordinator_id = self.bully.coordinator_id
         if coordinator_id is None:
-            coordinator_text = "chua xac dinh"
+            coordinator_text = "chưa xác định"
         else:
             coordinator_text = str(coordinator_id)
         self.app.post_event("coordinator", coordinator_text)
@@ -192,7 +207,7 @@ class NodeRuntime:
 
         if is_waiting and coordinator_changed:
             reason = (
-                f"coordinator doi tu {self._last_coordinator_id} "
+                f"điều phối viên đổi từ {self._last_coordinator_id} "
                 f"sang {coordinator_text}"
             )
             self._cancel_pending(reason)
@@ -205,11 +220,32 @@ class NodeRuntime:
         balance_thread.start()
 
     def _refresh_balance(self) -> None:
+        # Đọc và đưa kết quả lên UI theo thứ tự, tránh số dư cũ ghi đè số dư mới.
+        with self._balance_refresh_lock:
+            self._read_balance_for_ui()
+
+    def _read_balance_for_ui(self) -> None:
         try:
             balance = self.bank.get_balance()
             self.app.post_event("balance", f"{balance:,}")
         except Exception as exc:
-            self.app.post_event("log", f"[DB] Loi doc so du: {exc}")
+            self._ui_log(f"[CSDL] Lỗi đọc số dư: {exc}")
+
+    def _broadcast_balance_changed(self) -> None:
+        """Báo các nút đọc lại DB sau khi giao dịch đã commit và trả khoá."""
+        payload = {"type": "BALANCE_CHANGED", "from": self.node_id}
+        for node_config in self.config.get("nodes", []):
+            peer_id = int(node_config["id"])
+            if peer_id == self.node_id:
+                continue
+            try:
+                sent = self.server.send(peer_id, payload)
+                if not sent and self.server.connect_to_peer(peer_id):
+                    sent = self.server.send(peer_id, payload)
+                if not sent:
+                    self._ui_log(f"[Số dư] Chưa gửi được thông báo tới nút {peer_id}")
+            except Exception as exc:
+                self._ui_log(f"[Số dư] Lỗi gửi thông báo tới nút {peer_id}: {exc}")
 
     # ------------------------------------------------------------------
     # Trạng thái đơn xin quyền
@@ -224,7 +260,7 @@ class NodeRuntime:
             self._pending_amount = 0
             self._pending_sent_at = None
 
-        self._ui_log(f"[LOCK] Huy giao dich dang cho ({reason}), vui long bam lai")
+        self._ui_log(f"[Khoá] Huỷ giao dịch đang chờ ({reason}), vui lòng bấm lại")
 
     def _mark_acknowledged(self) -> None:
         """Coordinator đã phản hồi: ngừng đếm thời gian chờ."""
@@ -249,7 +285,7 @@ class NodeRuntime:
 
         # Chỉ báo một lần cho đơn này, tránh spam log mỗi vòng cập nhật.
         self._mark_acknowledged()
-        self._ui_log("Dieu phoi vien khong phan hoi, bat dau bau chon")
+        self._ui_log("Điều phối viên không phản hồi, bắt đầu bầu chọn")
         self.bully.trigger_election("REQUEST_LOCK_NO_REPLY")
 
     # ------------------------------------------------------------------
@@ -260,12 +296,12 @@ class NodeRuntime:
         """Người dùng bấm Nạp/Rút: gửi REQUEST_LOCK tới coordinator."""
         coordinator_id = self.bully.coordinator_id
         if coordinator_id is None:
-            self._ui_log("Chua xac dinh coordinator, khong the xin quyen")
+            self._ui_log("Chưa xác định điều phối viên, không thể xin quyền")
             return
 
         with self._pending_lock:
             if self._pending_type is not None:
-                self._ui_log("Dang cho quyen cho giao dich truoc, vui long doi")
+                self._ui_log("Đang chờ quyền cho giao dịch trước, vui lòng đợi")
                 return
 
             self._pending_type = tx_type
@@ -276,8 +312,8 @@ class NodeRuntime:
         # coordinator" phải là người này.
         self._last_coordinator_id = coordinator_id
         self._ui_log(
-            f"Gui REQUEST_LOCK toi coordinator {coordinator_id} "
-            f"({tx_type} {amount:,})"
+            f"Gửi yêu cầu xin quyền tới điều phối viên {coordinator_id} "
+            f"({'nạp' if tx_type == 'DEPOSIT' else 'rút'} {amount:,})"
         )
 
         if self.bully.is_coordinator():
@@ -288,7 +324,7 @@ class NodeRuntime:
 
         payload = {"type": "REQUEST_LOCK", "from": self.node_id}
         if not self.server.send(coordinator_id, payload):
-            self._ui_log("Khong gui duoc REQUEST_LOCK, bat dau bau chon")
+            self._ui_log("Không gửi được yêu cầu xin quyền, bắt đầu bầu chọn")
             self.bully.trigger_election("REQUEST_LOCK_SEND_FAIL")
 
     def _on_lock_request(self, requester: int, result: str) -> None:
@@ -297,7 +333,8 @@ class NodeRuntime:
         `result` là "GRANTED" hoặc "QUEUED". Node xin quyền cần biết kết quả
         để phân biệt "đang xếp hàng" với "coordinator đã chết".
         """
-        self.app.post_event("log", f"[LOCK] REQUEST_LOCK tu node {requester} -> {result}")
+        result_text = "được cấp quyền" if result == "GRANTED" else "đang xếp hàng"
+        self._ui_log(f"[Khoá] Nút {requester} xin quyền: {result_text}")
 
         if result == "GRANTED":
             self._grant_to(requester)
@@ -325,18 +362,15 @@ class NodeRuntime:
             amount = self._pending_amount
 
         if not tx_type:
-            self.app.post_event(
-                "log",
-                "[LOCK] Nhan GRANT_LOCK nhung khong co giao dich cho",
-            )
+            self._ui_log("[Khoá] Nhận quyền nhưng không còn giao dịch chờ, trả quyền ngay")
             # Phải trả quyền ngay. Nếu im lặng, coordinator vẫn ghi nhận node
             # này đang giữ khoá và hàng đợi FIFO bị kẹt vô hạn.
             self.release_lock()
             return
 
-        self.app.post_event(
-            "log",
-            f"[LOCK] Duoc cap quyen, thuc hien {tx_type} {amount:,}",
+        self._ui_log(
+            f"[Khoá] Được cấp quyền, thực hiện "
+            f"{'nạp' if tx_type == 'DEPOSIT' else 'rút'} {amount:,}"
         )
 
         transaction_thread = threading.Thread(
@@ -348,23 +382,24 @@ class NodeRuntime:
 
     def _do_transaction(self, tx_type: str, amount: int) -> None:
         """Thực hiện giao dịch sau khi đã được cấp quyền (chạy ở thread nền)."""
+        succeeded = False
         try:
             if tx_type == "DEPOSIT":
                 succeeded = self.bank.deposit(self.node_id, amount)
                 if succeeded:
-                    message = f"Nap {amount:,} thanh cong"
+                    message = f"Nạp {amount:,} thành công"
                 else:
-                    message = f"Nap {amount:,} that bai"
+                    message = f"Nạp {amount:,} thất bại"
             else:
                 succeeded = self.bank.withdraw(self.node_id, amount)
                 if succeeded:
-                    message = f"Rut {amount:,} thanh cong"
+                    message = f"Rút {amount:,} thành công"
                 else:
-                    message = f"Rut {amount:,} that bai (so du khong du?)"
+                    message = f"Rút {amount:,} thất bại (số dư không đủ hoặc số tiền không hợp lệ)"
 
-            self.app.post_event("log", f"[TX] {message}")
+            self._ui_log(f"[Giao dịch] {message}")
         except Exception as exc:
-            self.app.post_event("log", f"[TX] Loi giao dich: {exc}")
+            self._ui_log(f"[Giao dịch] Lỗi giao dịch: {exc}")
         finally:
             # Xoá đơn TRƯỚC khi trả khoá. Nếu trả khoá trước, coordinator có
             # thể cấp quyền lại cho chính node này và giao dịch chạy lặp.
@@ -375,6 +410,9 @@ class NodeRuntime:
 
             self.release_lock()
             self.refresh_balance_async()
+
+        if succeeded:
+            self._broadcast_balance_changed()
 
     def release_lock(self) -> None:
         """Trả quyền truy cập số dư về cho coordinator."""
@@ -390,13 +428,13 @@ class NodeRuntime:
 
         payload = {"type": "RELEASE_LOCK", "from": self.node_id}
         if not self.server.send(coordinator_id, payload):
-            self._ui_log("Khong gui duoc RELEASE_LOCK, coordinator co the da tat")
+            self._ui_log("Không trả được quyền, điều phối viên có thể đã tắt")
 
     def _deliver_next(self, holder: int, next_holder) -> None:
         """Coordinator cấp quyền cho node kế tiếp trong hàng đợi FIFO."""
-        self.app.post_event(
-            "log",
-            f"[LOCK] RELEASE_LOCK tu node {holder}, next={next_holder}",
+        self._ui_log(
+            f"[Khoá] Nút {holder} trả quyền; "
+            f"{'hàng đợi trống' if next_holder is None else f'cấp tiếp cho nút {next_holder}'}"
         )
 
         if next_holder is None:
@@ -411,6 +449,13 @@ class NodeRuntime:
     def on_message(self, node_id: int, message: dict, peer_id, conn) -> None:
         """Xử lý một gói tin vừa nhận từ NetworkServer."""
         message_type = message.get("type")
+        if message_type == "BALANCE_CHANGED":
+            sender = message.get("from")
+            if sender != self.node_id and find_node_config(self.config, sender) is not None:
+                self._ui_log(f"[Số dư] Nút {sender} vừa giao dịch, đang cập nhật số dư")
+                self.refresh_balance_async()
+            return
+
         was_coordinator = self.bully.is_coordinator()
 
         if message_type in BULLY_MESSAGE_TYPES:
@@ -420,7 +465,7 @@ class NodeRuntime:
                 # Vừa mất vai trò coordinator: hàng đợi khoá cũ không còn
                 # ai trả lời được nữa (docs/FLOWS.md mục 3).
                 self.bank.reset_lock()
-                self._ui_log("[LOCK] Xoa trang thai khoa vi khong con la coordinator")
+                self._ui_log("[Khoá] Xoá trạng thái khoá vì không còn là điều phối viên")
 
             self.update_status()
             return
@@ -447,7 +492,7 @@ class NodeRuntime:
             self._mark_acknowledged()
             sender = message.get("from")
             self._ui_log(
-                f"[LOCK] Coordinator {sender} da nhan don, dang xep hang cho quyen"
+                f"[Khoá] Điều phối viên {sender} đã nhận đơn, đang xếp hàng chờ quyền"
             )
             return
 
@@ -455,37 +500,37 @@ class NodeRuntime:
 def main() -> None:
     """Khởi động một node từ tham số dòng lệnh --id."""
     parser = argparse.ArgumentParser(
-        description="Chay mot node trong He thong Quy chung Phan tan"
+        description="Chạy một nút trong Hệ thống Quỹ chung Phân tán"
     )
-    parser.add_argument("--id", type=int, required=True, help="ID cua node (0-5)")
+    parser.add_argument("--id", type=int, required=True, help="ID của nút (0-5)")
     args = parser.parse_args()
     node_id = args.id
 
     config = load_config()
     node_config = find_node_config(config, node_id)
     if node_config is None:
-        print(f"Khong tim thay node id={node_id} trong config.json", file=sys.stderr)
+        print(f"Không tìm thấy nút id={node_id} trong config.json", file=sys.stderr)
         sys.exit(1)
 
     host = node_config.get("ip", "0.0.0.0")
     port = int(node_config.get("port", 3000 + node_id))
-    log_event(node_id, "NODE_START", f"id={node_id} host={host} port={port}")
+    log_event(node_id, "NODE_START", f"Nút {node_id}, địa chỉ {host}:{port}")
 
     # Mạng phải sẵn sàng trước UI. Nếu bind thất bại thì dừng ngay, không mở
     # giao diện chạy mà không ai kết nối được tới.
     server = start_node(node_id)
     if server is None:
         print(
-            f"Node {node_id} khong bind duoc {host}:{port}. "
-            "Kiem tra port dang bi chiem hoac IP trong config.json "
-            "khong phai IP cua may nay.",
+            f"Nút {node_id} không mở được cổng tại {host}:{port}. "
+            "Kiểm tra cổng đang bị chiếm hoặc IP trong config.json "
+            "không phải IP của máy này.",
             file=sys.stderr,
         )
         sys.exit(1)
 
     root = tk.Tk()
     app = AppWindow(root, node_id)
-    app.post_event("log", f"Node {node_id} khoi dong tai {host}:{port}")
+    app.post_event("log", f"Nút {node_id} khởi động tại {host}:{port}")
 
     bank = BankService()
     bully = Bully(server, node_id)

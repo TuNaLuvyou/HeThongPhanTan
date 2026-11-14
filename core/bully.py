@@ -99,22 +99,25 @@ class Bully:
 
     def start(self) -> bool:
         """Bật vòng canh nền và bắt đầu bầu coordinator lần đầu."""
-        if self._running:
-            return True
-
-        self._running = True
-        self._stopped = False
-
-        self._loop_thread = threading.Thread(target=self._main_loop, daemon=True)
-        self._loop_thread.start()
+        with self._election_lock:
+            if self._stopped:
+                return False
+            if self._running:
+                return True
+            self._running = True
+            # Thời gian kết nối peer không được tính là coordinator im lặng.
+            self._last_coordinator_seen = time.monotonic()
+            self._loop_thread = threading.Thread(target=self._main_loop, daemon=True)
+            self._loop_thread.start()
 
         self._start_election("STARTUP")
         return True
 
     def stop(self) -> None:
         """Tắt vòng canh và đánh dấu node đã chủ động rời mạng."""
-        self._running = False
-        self._stopped = True
+        with self._election_lock:
+            self._running = False
+            self._stopped = True
 
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=HEARTBEAT_INTERVAL)
@@ -151,7 +154,7 @@ class Bully:
         """
         if self._stopped:
             # Người dùng đã đóng cửa sổ: node coi như đã rời mạng.
-            log_event(self.node_id, "IGNORE_AFTER_STOP", f"type=ELECTION reason={reason}")
+            log_event(self.node_id, "IGNORE_AFTER_STOP", "Bỏ qua yêu cầu bầu chọn vì nút đã dừng")
             return
 
         with self._election_lock:
@@ -163,7 +166,16 @@ class Bully:
             self._election_answers = {}
 
         self._last_coordinator_seen = time.monotonic()
-        log_event(self.node_id, "ELECTION_START", f"from_node={self.node_id} reason={reason}")
+        reason_text = {
+            "STARTUP": "khởi động nút",
+            "WATCHDOG": "không nhận được phản hồi từ điều phối viên",
+            "REQUEST_LOCK_NO_REPLY": "yêu cầu xin quyền không được phản hồi",
+            "REQUEST_LOCK_SEND_FAIL": "không gửi được yêu cầu xin quyền",
+            "MANUAL": "yêu cầu thủ công",
+        }.get(reason, reason)
+        if reason.startswith("ELECTION_FROM_"):
+            reason_text = f"nhận yêu cầu bầu chọn từ nút {reason.removeprefix('ELECTION_FROM_')}"
+        log_event(self.node_id, "ELECTION_START", f"Nút {self.node_id}; lý do: {reason_text}")
 
         # Chỉ các node có ID lớn hơn mới có quyền trả lời.
         higher_peer_ids = []
@@ -175,14 +187,14 @@ class Bully:
         for peer_id in higher_peer_ids:
             payload = {"type": ELECTION, "from": self.node_id}
             if not self.server.send(peer_id, payload):
-                log_event(self.node_id, "ELECTION_SEND_FAIL", f"peer={peer_id}")
+                log_event(self.node_id, "ELECTION_SEND_FAIL", f"Nút nhận: {peer_id}")
 
         deadline = time.monotonic() + ELECTION_ANSWER_TIMEOUT
         answered_peer_ids = []
 
         while True:
             with self._election_lock:
-                if self.state != "ELECTING":
+                if self._stopped or self.state != "ELECTING":
                     # Một node khác đã công bố COORDINATOR trong lúc mình chờ.
                     return
 
@@ -197,7 +209,7 @@ class Bully:
                     self._last_coordinator_seen = time.monotonic()
 
             if answered_peer_ids:
-                log_event(self.node_id, "ELECTION_YIELD", f"higher_alive={answered_peer_ids}")
+                log_event(self.node_id, "ELECTION_YIELD", f"Các nút ID cao hơn đang hoạt động: {answered_peer_ids}")
                 return
 
             if time.monotonic() >= deadline:
@@ -206,14 +218,14 @@ class Bully:
             time.sleep(0.05)
 
         with self._election_lock:
-            if self.state != "ELECTING":
+            if self._stopped or self.state != "ELECTING":
                 return
             self.coordinator_id = self.node_id
             self.state = "COORDINATOR"
             self._last_coordinator_seen = time.monotonic()
             self._last_heartbeat_ack = {}
 
-        log_event(self.node_id, "BECOME_COORDINATOR", f"node={self.node_id}")
+        log_event(self.node_id, "BECOME_COORDINATOR", f"Điều phối viên mới: nút {self.node_id}")
         self._broadcast_coordinator()
 
     def _broadcast_coordinator(self) -> None:
@@ -274,7 +286,7 @@ class Bully:
         log_event(
             self.node_id,
             "PEERS_ALIVE",
-            f"coordinator={self.node_id} alive=[{snapshot}]",
+            f"Điều phối viên: {self.node_id}; các nút phản hồi: [{snapshot}]",
         )
 
     def _watch_coordinator(self) -> None:
@@ -290,13 +302,13 @@ class Bully:
             log_event(
                 self.node_id,
                 "COORDINATOR_FAIL",
-                f"coordinator={self.coordinator_id} silent",
+                f"Không nhận phản hồi từ điều phối viên {self.coordinator_id}",
             )
         else:
             log_event(
                 self.node_id,
                 "NO_COORDINATOR",
-                "yielded but no COORDINATOR announced",
+                "Đã nhường bầu chọn nhưng chưa nhận thông báo điều phối viên",
             )
 
         self._start_election("WATCHDOG")
@@ -375,7 +387,7 @@ class Bully:
             log_event(
                 self.node_id,
                 "IGNORE_AFTER_STOP",
-                f"type=COORDINATOR from={sender_id}",
+                f"Bỏ qua thông báo điều phối viên từ nút {sender_id}",
             )
             return
 
@@ -390,7 +402,7 @@ class Bully:
             event = "STEP_DOWN"
         else:
             event = "FOLLOW_COORDINATOR"
-        log_event(self.node_id, event, f"coordinator={sender_id}")
+        log_event(self.node_id, event, f"Điều phối viên hiện tại: nút {sender_id}")
 
     def _on_heartbeat(self, sender_id: Optional[int], conn: ClientConnection) -> None:
         """Node phụ trả HEARTBEAT_ACK và ghi nhận coordinator còn sống."""

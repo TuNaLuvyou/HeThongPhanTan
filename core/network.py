@@ -15,6 +15,7 @@ Quy ước định danh node gửi: lấy trường `from` trong gói tin, KHÔN
 
 import json
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -29,6 +30,11 @@ LOG_DIR = "logs"
 DEFAULT_HOST = "0.0.0.0"
 MESSAGE_DELIMITER = b"\n"
 BUFFER_SIZE = 4096
+
+# Terminal Windows hoặc đầu ra chuyển hướng có thể mặc định dùng cp1252.
+# Dùng UTF-8 để log tiếng Việt không làm dừng luồng mạng.
+if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +53,7 @@ def get_node_config(node_id: int) -> dict:
     for node_config in config.get("nodes", []):
         if node_config.get("id") == node_id:
             return node_config
-    raise ValueError(f"Khong tim thay node {node_id} trong {CONFIG_PATH}")
+    raise ValueError(f"Không tìm thấy nút {node_id} trong {CONFIG_PATH}")
 
 
 def get_host_by_id(node_id: int) -> str:
@@ -66,6 +72,41 @@ def get_port_by_id(node_id: int) -> int:
 # Ghi log
 # ---------------------------------------------------------------------------
 
+EVENT_LABELS = {
+    "NODE_START": "Khởi động nút",
+    "NODE_READY": "Nút sẵn sàng",
+    "NODE_START_FAILED": "Khởi động nút thất bại",
+    "SERVER_STARTED": "Đã mở cổng lắng nghe",
+    "SERVER_FAILED": "Không mở được cổng lắng nghe",
+    "CLIENT_CONNECTED": "Đã kết nối",
+    "CONNECT_FAILED": "Kết nối thất bại",
+    "HANDLER_ERROR": "Lỗi xử lý gói tin",
+    "BULLY_START": "Khởi động bầu chọn Bully",
+    "BULLY_STOP": "Dừng bầu chọn Bully",
+    "ELECTION_START": "Bắt đầu bầu chọn",
+    "ELECTION_SEND_FAIL": "Không gửi được yêu cầu bầu chọn",
+    "ELECTION_YIELD": "Nhường cho nút có ID cao hơn",
+    "BECOME_COORDINATOR": "Trở thành điều phối viên",
+    "PEERS_ALIVE": "Các nút đang phản hồi",
+    "COORDINATOR_FAIL": "Điều phối viên không phản hồi",
+    "NO_COORDINATOR": "Chưa có điều phối viên",
+    "IGNORE_AFTER_STOP": "Bỏ qua thông báo sau khi dừng",
+    "STEP_DOWN": "Nhường vai trò điều phối viên",
+    "FOLLOW_COORDINATOR": "Đã nhận điều phối viên",
+    "LOCK_GRANTED": "Đã cấp quyền",
+    "LOCK_QUEUED": "Đang xếp hàng chờ quyền",
+    "LOCK_RESET": "Đã xoá trạng thái khoá",
+    "DEPOSIT_INVALID": "Số tiền nạp không hợp lệ",
+    "DEPOSIT_OK": "Nạp tiền thành công",
+    "WITHDRAW_INVALID": "Số tiền rút không hợp lệ",
+    "WITHDRAW_REJECT": "Từ chối rút vì không đủ số dư",
+    "WITHDRAW_OK": "Rút tiền thành công",
+    "STOP_ERROR": "Lỗi khi dừng nút",
+    "PERIODIC_ERROR": "Lỗi cập nhật trạng thái",
+    "UI": "Thông báo",
+}
+
+
 def log_event(node_id: int, event: str, detail: str = "") -> None:
     """Ghi một sự kiện ra màn hình và ra file logs/node_<id>.log.
 
@@ -73,7 +114,8 @@ def log_event(node_id: int, event: str, detail: str = "") -> None:
         [thời gian] node <id> | <tên sự kiện> | <chi tiết>
     """
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] node {node_id} | {event} | {detail}"
+    event_text = EVENT_LABELS.get(event, event)
+    line = f"[{timestamp}] Nút {node_id} | {event_text} | {detail}"
     print(line, flush=True)
 
     log_dir = Path(LOG_DIR)
@@ -101,6 +143,7 @@ class ClientConnection:
         self._socket: Optional[socket.socket] = None
         self._buffer = b""
         self._closed = False
+        self._send_lock = threading.Lock()
 
     def attach(self, sock: socket.socket) -> None:
         """Gắn socket có sẵn vào kết nối (dùng cho kết nối do server accept)."""
@@ -135,7 +178,12 @@ class ClientConnection:
         try:
             json_text = json.dumps(payload)
             data = (json_text + "\n").encode("utf-8")
-            self._socket.sendall(data)
+            # Heartbeat và thông báo số dư có thể được gửi từ hai thread.
+            with self._send_lock:
+                sock = self._socket
+                if self._closed or sock is None:
+                    return False
+                sock.sendall(data)
             return True
         except OSError:
             self.close()
@@ -144,20 +192,23 @@ class ClientConnection:
     def receive(self) -> Optional[dict]:
         """Nhận một gói tin JSON.
 
-        Trả về None nếu hết timeout, gặp lỗi socket, hoặc kết nối bị đóng.
+        Khi hết timeout tiếp tục chờ; trả về None nếu lỗi hoặc kết nối đóng.
         """
         if self._closed or self._socket is None:
             return None
 
         # Đọc thêm dữ liệu cho tới khi có ít nhất một dòng hoàn chỉnh.
         while MESSAGE_DELIMITER not in self._buffer:
-            if self._closed:
+            sock = self._socket
+            if self._closed or sock is None:
                 return None
 
-            self._socket.settimeout(self.timeout)
             try:
-                chunk = self._socket.recv(BUFFER_SIZE)
-            except (socket.timeout, OSError):
+                sock.settimeout(self.timeout)
+                chunk = sock.recv(BUFFER_SIZE)
+            except socket.timeout:
+                continue
+            except OSError:
                 return None
 
             if not chunk:
@@ -198,6 +249,7 @@ class NetworkServer:
         self._running = False
         self._server_socket = None
         self._clients: dict = {}
+        self._connections: set = set()
         self._lock = threading.Lock()
         self._handler = None
 
@@ -224,7 +276,7 @@ class NetworkServer:
             self._server_socket = server_socket
             self._running = True
 
-            log_event(self.node_id, "SERVER_STARTED", f"host={self.host} port={self.port}")
+            log_event(self.node_id, "SERVER_STARTED", f"Địa chỉ: {self.host}:{self.port}")
 
             accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
             accept_thread.start()
@@ -244,8 +296,9 @@ class NetworkServer:
                 pass
 
         with self._lock:
-            for conn in self._clients.values():
+            for conn in self._connections:
                 conn.close()
+            self._connections.clear()
             self._clients.clear()
 
     def connect_to_peer(self, peer_id: int) -> bool:
@@ -256,11 +309,15 @@ class NetworkServer:
 
         conn = ClientConnection((host, port), timeout=self.timeout)
         if not conn.connect(host, port):
-            log_event(self.node_id, "CONNECT_FAILED", f"peer={peer_id}")
+            log_event(self.node_id, "CONNECT_FAILED", f"Không kết nối được tới nút {peer_id}")
             return False
 
         with self._lock:
+            if not self._running:
+                conn.close()
+                return False
             self._clients[peer_id] = conn
+            self._connections.add(conn)
 
         listen_thread = threading.Thread(
             target=self._listen_loop,
@@ -268,7 +325,7 @@ class NetworkServer:
             daemon=True,
         )
         listen_thread.start()
-        log_event(self.node_id, "CLIENT_CONNECTED", f"peer={peer_id}")
+        log_event(self.node_id, "CLIENT_CONNECTED", f"Kết nối tới nút {peer_id}")
         return True
 
     def send(self, peer_id: int, payload: dict) -> bool:
@@ -301,9 +358,14 @@ class NetworkServer:
 
             conn = ClientConnection(addr, timeout=self.timeout)
             conn.attach(sock)
+            with self._lock:
+                if not self._running:
+                    conn.close()
+                    break
+                self._connections.add(conn)
 
             peer_id = self._resolve_peer_id(addr)
-            log_event(self.node_id, "CLIENT_CONNECTED", f"{addr[0]}:{addr[1]} peer={peer_id}")
+            log_event(self.node_id, "CLIENT_CONNECTED", f"Nhận kết nối từ {addr[0]}:{addr[1]}; nút dự đoán: {peer_id}")
 
             listen_thread = threading.Thread(
                 target=self._listen_loop,
@@ -331,25 +393,40 @@ class NetworkServer:
         peer_id ban đầu có thể là None hoặc đoán từ IP. Khi gói tin có trường
         `from` thì dùng trường đó làm id chính thức của node gửi.
         """
-        while self._running:
-            message = conn.receive()
-            if message is None:
-                break
+        try:
+            while self._running:
+                message = conn.receive()
+                if message is None:
+                    break
 
-            sender_id = message.get("from")
-            if sender_id is not None:
+                sender_id = message.get("from")
+                if sender_id is not None:
+                    try:
+                        peer_id = int(sender_id)
+                        # Máy mở sau chỉ cần kết nối tới máy đang chạy.
+                        # Ghi nhận chiều nhận để máy cũ gửi ngược heartbeat,
+                        # thông báo điều phối viên và quyền trên cùng socket.
+                        with self._lock:
+                            if peer_id != self.node_id:
+                                self._clients.setdefault(peer_id, conn)
+                    except (TypeError, ValueError):
+                        pass
+
+                if self._handler is None:
+                    continue
+
                 try:
-                    peer_id = int(sender_id)
-                except (TypeError, ValueError):
-                    pass
-
-            if self._handler is None:
-                continue
-
-            try:
-                self._handler(self.node_id, message, peer_id, conn)
-            except Exception as exc:
-                log_event(self.node_id, "HANDLER_ERROR", str(exc))
+                    self._handler(self.node_id, message, peer_id, conn)
+                except Exception as exc:
+                    log_event(self.node_id, "HANDLER_ERROR", str(exc))
+        finally:
+            conn.close()
+            with self._lock:
+                self._connections.discard(conn)
+                # Chỉ xoá đúng kết nối này, không xoá kết nối mới thay thế.
+                for client_id, client in list(self._clients.items()):
+                    if client is conn:
+                        self._clients.pop(client_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +445,8 @@ def start_node(node_id: int) -> Optional[NetworkServer]:
 
     server = NetworkServer(node_id=node_id, host=host, port=port)
     if not server.start():
-        log_event(node_id, "NODE_START_FAILED", f"host={host} port={port}")
+        log_event(node_id, "NODE_START_FAILED", f"Địa chỉ: {host}:{port}")
         return None
 
-    log_event(node_id, "NODE_READY", f"host={host} port={port}")
+    log_event(node_id, "NODE_READY", f"Địa chỉ: {host}:{port}")
     return server

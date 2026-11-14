@@ -129,6 +129,12 @@ class FakeServer:
 class Cluster:
     def __init__(self):
         self.nodes = {}
+        self.runtimes = []
+
+    def stop(self):
+        for runtime in self.runtimes:
+            runtime._stop_event.set()
+            runtime.bully.stop()
 
     def add(self, node_id, coordinator, bully_factory=None):
         server = FakeServer(node_id, self)
@@ -156,6 +162,7 @@ class Cluster:
                 app_main.main()
 
         node = _Node(node_id, server, app_holder["app"], bank, bully)
+        self.runtimes.append(server.handler.__self__)
         self.nodes[node_id] = node
         return node
 
@@ -183,6 +190,11 @@ def wait_until(predicate, timeout=5.0):
 
 
 class LockFlowTest(unittest.TestCase):
+    def make_cluster(self):
+        cluster = Cluster()
+        self.addCleanup(cluster.stop)
+        return cluster
+
     def setUp(self):
         # DONG thoi gian cho de check_pending_timeout chay duoc trong test.
         patcher = mock.patch.object(app_main, "LOCK_REPLY_TIMEOUT", 0.1)
@@ -191,11 +203,12 @@ class LockFlowTest(unittest.TestCase):
 
     def test_coordinator_releases_its_own_lock(self):
         """Hoi truoc day: coordinator bam Nap xong thi khoa bi giu mai, 5 node con lai ket tran."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
 
         coordinator.app.on_deposit(50000)
-        self.assertTrue(wait_until(lambda: coordinator.bank.tx == [("DEPOSIT", 5, 50000)]))
+        self.assertTrue(wait_until(lambda: coordinator.bank.tx == [("DEPOSIT", 5, 50000)]
+                                  and coordinator.bank._lock_holder is None))
         self.assertIsNone(coordinator.bank._lock_holder)
 
         # Node khac phai xin duoc quyen sau do, khong bi nam trong hang doi vo tan.
@@ -204,18 +217,19 @@ class LockFlowTest(unittest.TestCase):
 
     def test_lock_moves_between_two_nodes(self):
         """Node 3 nap tien qua coordinator 5: REQUEST -> GRANT -> TX -> RELEASE -> khoa rong."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
 
         node3.app.on_deposit(1000)
-        self.assertTrue(wait_until(lambda: node3.bank.tx == [("DEPOSIT", 3, 1000)]))
+        self.assertTrue(wait_until(lambda: node3.bank.tx == [("DEPOSIT", 3, 1000)]
+                                  and coordinator.bank._lock_holder is None))
         self.assertIsNone(coordinator.bank._lock_holder)
         self.assertEqual([], coordinator.bank.tx)
 
     def test_second_node_waits_in_fifo_queue(self):
         """Node 4 xin quyen khi node 3 dang giu: nhan LOCK_QUEUED, roi duoc GRANT_LOCK theo thu tu."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
         node4 = cluster.add(4, coordinator=5)
@@ -230,20 +244,22 @@ class LockFlowTest(unittest.TestCase):
         self.assertIn((4, {"type": "LOCK_QUEUED", "from": 5}), coordinator.server.sent)
 
         gate.set()
-        self.assertTrue(wait_until(lambda: node4.bank.tx == [("DEPOSIT", 4, 200)]))
+        self.assertTrue(wait_until(lambda: node4.bank.tx == [("DEPOSIT", 4, 200)]
+                                  and coordinator.bank._lock_holder is None))
         self.assertEqual([("DEPOSIT", 3, 100)], node3.bank.tx)
         self.assertIsNone(coordinator.bank._lock_holder)
         self.assertEqual([], coordinator.bank._lock_queue)
 
     def test_failed_transaction_still_releases_lock(self):
         """Rut vuot so du bi tu choi van phai tra khoa (FLOWS muc 5)."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
         node3.bank.fail = True
 
         node3.app.on_withdraw(999999)
-        self.assertTrue(wait_until(lambda: node3.bank.tx == [("WITHDRAW", 3, 999999)]))
+        self.assertTrue(wait_until(lambda: node3.bank.tx == [("WITHDRAW", 3, 999999)]
+                                  and coordinator.bank._lock_holder is None))
         self.assertIsNone(coordinator.bank._lock_holder)
 
         coordinator.dispatch({"type": "REQUEST_LOCK", "from": 4}, 4)
@@ -251,7 +267,7 @@ class LockFlowTest(unittest.TestCase):
 
     def test_demoted_coordinator_clears_lock_state(self):
         """FLOWS muc 3: mat vai tro coordinator thi hang doi cu phai bi xoa sach."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         coordinator.bank._lock_holder = 3
         coordinator.bank._lock_queue = [4]
@@ -265,7 +281,7 @@ class LockFlowTest(unittest.TestCase):
 
     def test_pending_request_cancelled_on_coordinator_change(self):
         """Don xin quyen bi vo hieu khi doi coordinator thi phai huy de user bam lai duoc."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
         # Phai de vong cap nhat trang thai ghi lai coordinator hien tai truoc khi doi.
@@ -278,14 +294,14 @@ class LockFlowTest(unittest.TestCase):
 
         node3.bully.coordinator_id = 6  # mang vua bau lai coordinator khac
         self.assertTrue(
-            wait_until(lambda: any("Huy giao dich dang cho" in line for line in node3.app.logs()), timeout=8.0)
+            wait_until(lambda: any("Huỷ giao dịch đang chờ" in line for line in node3.app.logs()), timeout=8.0)
         )
         self.assertEqual([], node3.bank.tx)
 
     def test_pending_sent_to_new_coordinator_not_cancelled(self):
         """Bam Nap ngay sau khi bau coordinator moi, truoc vong periodic ke tiep:
         don gui toi coordinator moi khong duoc huy oan nhu don cu cua coordinator cu."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         cluster.add(5, coordinator=5)
         coordinator6 = cluster.add(6, coordinator=6)
         node3 = cluster.add(3, coordinator=5)
@@ -298,7 +314,7 @@ class LockFlowTest(unittest.TestCase):
 
         # Cho chac chan it nhat mot vong periodic chay xong voi coordinator moi.
         self.assertTrue(wait_until(lambda: ("coordinator", "6") in node3.app.events))
-        self.assertFalse(any("Huy giao dich dang cho" in line for line in node3.app.logs()))
+        self.assertFalse(any("Huỷ giao dịch đang chờ" in line for line in node3.app.logs()))
 
         coordinator6.dispatch({"type": "RELEASE_LOCK", "from": 9}, 9)
         self.assertTrue(wait_until(lambda: node3.bank.tx == [("DEPOSIT", 3, 100)]))
@@ -306,7 +322,7 @@ class LockFlowTest(unittest.TestCase):
     def test_orphan_grant_releases_lock_immediately(self):
         """Coordinator cap quyen ma node khong con don cho (don bi huy) thi node phai tra ngay,
         neu khong coordinator ghi oan node do van giu quyen va FIFO ket tran vo han."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
         coordinator.bank._lock_holder = 3
@@ -321,7 +337,7 @@ class LockFlowTest(unittest.TestCase):
 
     def test_unreachable_coordinator_triggers_election(self):
         """Gui REQUEST_LOCK that bai (coordinator da tat) thi phai bau lai, khong choi im lang."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
         node3.server.down_peers.add(5)
@@ -331,7 +347,7 @@ class LockFlowTest(unittest.TestCase):
 
     def test_silent_coordinator_triggers_election(self):
         """FLOWS muc 2b: REQUEST_LOCK khong co phan hoi thi bau lai."""
-        cluster = Cluster()
+        cluster = self.make_cluster()
         coordinator = cluster.add(5, coordinator=5)
         node3 = cluster.add(3, coordinator=5)
         # Co lien ket nhung khong bao gio tra loi: cat handler cua coordinator.
@@ -339,7 +355,7 @@ class LockFlowTest(unittest.TestCase):
 
         node3.app.on_deposit(100)
         self.assertTrue(wait_until(lambda: "REQUEST_LOCK_NO_REPLY" in node3.bully.elections, timeout=8.0))
-        self.assertTrue(any("khong phan hoi" in line for line in node3.app.logs()))
+        self.assertTrue(any("không phản hồi" in line for line in node3.app.logs()))
 
 
 if __name__ == "__main__":

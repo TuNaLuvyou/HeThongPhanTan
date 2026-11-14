@@ -73,7 +73,7 @@ class BankService:
 
         if not self.database_url:
             raise RuntimeError(
-                "Thieu DATABASE_URL. Nguoi dat cau hinh can dien DATABASE_URL tu .env"
+                "Thiếu DATABASE_URL. Vui lòng điền DATABASE_URL trong .env"
             )
 
         self._conn = psycopg2.connect(self.database_url)
@@ -101,14 +101,14 @@ class BankService:
 
         if lock_is_free or already_holds_lock:
             self._lock_holder = node_id
-            log_event(node_id, "LOCK_GRANTED", f"holder={node_id}")
+            log_event(node_id, "LOCK_GRANTED", f"Nút giữ quyền: {node_id}")
             return LOCK_GRANTED
 
         self._lock_queue.append(node_id)
         log_event(
             node_id,
             "LOCK_QUEUED",
-            f"holder={self._lock_holder} queue={self._lock_queue}",
+            f"Nút giữ quyền: {self._lock_holder}; hàng đợi: {self._lock_queue}",
         )
         return LOCK_QUEUED
 
@@ -128,7 +128,7 @@ class BankService:
 
         next_holder = self._lock_queue.pop(0)
         self._lock_holder = next_holder
-        log_event(next_holder, "LOCK_GRANTED", f"holder={next_holder}")
+        log_event(next_holder, "LOCK_GRANTED", f"Nút giữ quyền: {next_holder}")
         return next_holder
 
     def reset_lock(self) -> None:
@@ -144,7 +144,7 @@ class BankService:
         log_event(
             -1,
             "LOCK_RESET",
-            f"holder={self._lock_holder} queue={self._lock_queue}",
+            f"Nút giữ quyền cũ: {self._lock_holder}; hàng đợi cũ: {self._lock_queue}",
         )
         self._lock_holder = None
         self._lock_queue = []
@@ -154,16 +154,21 @@ class BankService:
     # ------------------------------------------------------------------
 
     def get_balance(self) -> int:
-        """Đọc số dư hiện tại từ bảng fund."""
-        conn = self._connect()
-        with conn.cursor() as cursor:
-            balance = self._read_balance(cursor, INITIAL_BALANCE)
-        return balance
+        """Đọc số dư bằng kết nối riêng, không dùng chung phiên đang ghi."""
+        if not self.database_url:
+            raise RuntimeError("Thiếu DATABASE_URL. Vui lòng điền DATABASE_URL trong .env")
+        conn = psycopg2.connect(self.database_url)
+        try:
+            with conn:
+                with conn.cursor() as cursor:
+                    return self._read_balance(cursor, INITIAL_BALANCE)
+        finally:
+            conn.close()
 
     def deposit(self, node_id: int, amount: int) -> bool:
         """Nạp tiền vào quỹ: balance += amount, ghi một dòng DEPOSIT."""
         if not self._is_valid_amount(amount):
-            log_event(node_id, "DEPOSIT_INVALID", f"amount={amount}")
+            log_event(node_id, "DEPOSIT_INVALID", f"Số tiền không hợp lệ: {amount}")
             return False
 
         conn = self._connect()
@@ -184,7 +189,7 @@ class BankService:
             )
 
         conn.commit()
-        log_event(node_id, "DEPOSIT_OK", f"amount={amount} new_balance={new_balance}")
+        log_event(node_id, "DEPOSIT_OK", f"Nạp {amount:,}; số dư mới: {new_balance:,}")
         return True
 
     def withdraw(self, node_id: int, amount: int) -> bool:
@@ -193,7 +198,7 @@ class BankService:
         Trả về False nếu số tiền không hợp lệ hoặc số dư không đủ.
         """
         if not self._is_valid_amount(amount):
-            log_event(node_id, "WITHDRAW_INVALID", f"amount={amount}")
+            log_event(node_id, "WITHDRAW_INVALID", f"Số tiền không hợp lệ: {amount}")
             return False
 
         conn = self._connect()
@@ -204,7 +209,7 @@ class BankService:
                 log_event(
                     node_id,
                     "WITHDRAW_REJECT",
-                    f"amount={amount} balance={balance}",
+                    f"Yêu cầu rút: {amount:,}; số dư hiện tại: {balance:,}",
                 )
                 return False
 
@@ -221,7 +226,7 @@ class BankService:
             )
 
         conn.commit()
-        log_event(node_id, "WITHDRAW_OK", f"amount={amount} new_balance={new_balance}")
+        log_event(node_id, "WITHDRAW_OK", f"Rút {amount:,}; số dư mới: {new_balance:,}")
         return True
 
     # ------------------------------------------------------------------

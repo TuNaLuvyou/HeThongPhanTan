@@ -10,14 +10,16 @@
 
 ## 3. Quỹ chung
 - Số dư lưu trong CSDL (Supabase Postgres).
-- Số dư ban đầu: 10,000,000 (`config.json`: `shared_balance_initial`).
-- Chỉ node đang được coordinator cấp quyền mới được đọc và ghi số dư.
+- Số dư ban đầu: 10,000,000, được khởi tạo bởi `db/schema.sql`. `shared_balance_initial` trong cấu hình chưa được code dùng để thay đổi số dư DB; thay giá trị cấu hình không reset quỹ.
+- Trong giao dịch nạp/rút, node phải được coordinator cấp quyền trước khi đọc, tính và ghi số dư. Đọc số dư chỉ để hiển thị trên giao diện không xin khoá và không thay đổi quỹ.
 
 ## 4. Chức năng cho người dùng
 - **Xem trạng thái node**: Vai trò (Node bình thường / Coordinator), ID coordinator hiện tại, tự động cập nhật.
 - **Nạp tiền**: Gửi yêu cầu xin quyền và nạp tiền vào quỹ.
 - **Rút tiền**: Gửi yêu cầu xin quyền và rút tiền từ quỹ.
 - **Xem History Log**: Theo dõi tiến trình bầu chọn, xin/được cấp/trả quyền, và các giao dịch.
+- **Đồng bộ số dư giữa các máy**: sau giao dịch thành công, node thông báo để các node khác đọc lại số dư từ DB. Node không nhận được thông báo có thể còn hiển thị số dư cũ; khi mở lại ứng dụng sẽ đọc số dư hiện tại.
+- **Giao diện tối giản bằng tiếng Việt**: số dư được làm nổi bật, hiển thị vai trò và điều phối viên; nhật ký có thời gian và màu phân biệt thành công/lỗi.
 
 ## 5. Quy tắc nghiệp vụ
 - **Kiểm tra số dư**: Không rút vượt quá số dư hiện có.
