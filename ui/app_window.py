@@ -1,5 +1,17 @@
-# ui/app_window.py - Thanh vien 5 (Windows 1) - Giao dien Tkinter: header trang thai tu cap nhat, History Log, Quy chung va Nap/Rut
-# Doc tham chieu: docs/BUSINESS.md (muc 4), docs/RULES.md (muc 5)
+# ui/app_window.py - Thành viên 5 (Windows 1)
+"""Giao diện Tkinter của một node.
+
+Cửa sổ gồm ba phần:
+- Header    : vai trò hiện tại, ID coordinator, số dư quỹ.
+- Nạp/Rút   : ô nhập số tiền và hai nút thao tác.
+- History Log: nhật ký bầu chọn, xin/cấp/trả quyền và giao dịch.
+
+Lưu ý về thread: Tkinter chỉ được cập nhật từ luồng chính. Các luồng mạng
+hoặc luồng nền không gọi trực tiếp widget, mà đẩy sự kiện vào `_event_queue`
+bằng post_event(); luồng chính lấy ra và vẽ bằng after() (RULES mục 5).
+
+Tài liệu tham chiếu: docs/BUSINESS.md (mục 4), docs/RULES.md (mục 5).
+"""
 
 import queue
 import tkinter as tk
@@ -8,69 +20,122 @@ from typing import Callable, Optional
 
 
 class AppWindow:
-    """Cua so giao dien chinh cho mot node.
-
-    - Header: hien thi vai tro (Node/Coordinator), ID coordinator hien tai.
-    - History Log: hien thi tien trinh bau chon, xin/cap/tra quyen, giao dich.
-    - Quy chung va Nap/Rut: nhap so tien, nut nap/rut.
-    - Cap nhat UI tu luong chinh bang queue + after (RULES muc 5).
-    """
+    """Cửa sổ giao diện chính của một node."""
 
     def __init__(self, root: tk.Tk, node_id: int):
         self.root = root
         self.node_id = node_id
         self.root.title(f"Quy chung phan tan - Node {node_id}")
+
+        # Hàng đợi sự kiện từ các luồng khác gửi về luồng giao diện.
         self._event_queue: queue.Queue = queue.Queue()
 
-        # Callbacks do main/tich hop gan vao
+        # Callback do main.py gắn vào sau khi khởi tạo.
         self.on_deposit: Optional[Callable[[int], None]] = None
         self.on_withdraw: Optional[Callable[[int], None]] = None
 
         self._build_ui()
         self._poll_queue()
 
+    # ------------------------------------------------------------------
+    # Dựng giao diện
+    # ------------------------------------------------------------------
+
     def _build_ui(self) -> None:
-        # Header trang thai
+        """Tạo toàn bộ widget của cửa sổ."""
+        self._build_header()
+        self._build_action_area()
+        self._build_log_area()
+
+    def _build_header(self) -> None:
+        """Phần đầu cửa sổ: vai trò, coordinator, số dư."""
         header = tk.Frame(self.root, padx=8, pady=8)
         header.pack(fill=tk.X)
+
         self.role_var = tk.StringVar(value="Vai tro: Node binh thuong")
         self.coordinator_var = tk.StringVar(value="Coordinator: chua xac dinh")
         self.balance_var = tk.StringVar(value="So du: -")
-        tk.Label(header, textvariable=self.role_var, font=("Arial", 11, "bold")).pack(anchor="w")
-        tk.Label(header, textvariable=self.coordinator_var).pack(anchor="w")
-        tk.Label(header, textvariable=self.balance_var).pack(anchor="w")
 
-        # Khu vuc Nap/Rut
-        action_frame = tk.LabelFrame(self.root, text="Quy chung - Nap/Rut", padx=8, pady=8)
+        role_label = tk.Label(header, textvariable=self.role_var, font=("Arial", 11, "bold"))
+        role_label.pack(anchor="w")
+
+        coordinator_label = tk.Label(header, textvariable=self.coordinator_var)
+        coordinator_label.pack(anchor="w")
+
+        balance_label = tk.Label(header, textvariable=self.balance_var)
+        balance_label.pack(anchor="w")
+
+    def _build_action_area(self) -> None:
+        """Khu vực nhập số tiền và bấm Nạp/Rút."""
+        action_frame = tk.LabelFrame(
+            self.root,
+            text="Quy chung - Nap/Rut",
+            padx=8,
+            pady=8,
+        )
         action_frame.pack(fill=tk.X, padx=8, pady=4)
-        tk.Label(action_frame, text="So tien:").grid(row=0, column=0, sticky="w")
+
+        amount_label = tk.Label(action_frame, text="So tien:")
+        amount_label.grid(row=0, column=0, sticky="w")
+
         self.amount_entry = tk.Entry(action_frame, width=20)
         self.amount_entry.grid(row=0, column=1, padx=4)
-        tk.Button(action_frame, text="Nap tien", command=self._handle_deposit).grid(row=0, column=2, padx=4)
-        tk.Button(action_frame, text="Rut tien", command=self._handle_withdraw).grid(row=0, column=3, padx=4)
 
-        # History Log
+        deposit_button = tk.Button(
+            action_frame,
+            text="Nap tien",
+            command=self._handle_deposit,
+        )
+        deposit_button.grid(row=0, column=2, padx=4)
+
+        withdraw_button = tk.Button(
+            action_frame,
+            text="Rut tien",
+            command=self._handle_withdraw,
+        )
+        withdraw_button.grid(row=0, column=3, padx=4)
+
+    def _build_log_area(self) -> None:
+        """Khu vực History Log."""
         log_frame = tk.LabelFrame(self.root, text="History Log", padx=8, pady=8)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=18, state=tk.DISABLED, wrap=tk.WORD)
+
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame,
+            height=18,
+            state=tk.DISABLED,
+            wrap=tk.WORD,
+        )
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-    # ----------------------------------------------------------- UI updates (thread-safe)
+    # ------------------------------------------------------------------
+    # Nhận sự kiện từ luồng khác (thread-safe)
+    # ------------------------------------------------------------------
 
     def post_event(self, kind: str, payload=None) -> None:
-        """Day su kien tu thread khac vao queue de cap nhat tren luong chinh."""
+        """Đẩy một sự kiện vào hàng đợi để luồng chính xử lý sau.
+
+        Các loại sự kiện đang dùng:
+            "log"         - thêm một dòng vào History Log.
+            "role"        - cập nhật vai trò (Node/Coordinator).
+            "coordinator" - cập nhật ID coordinator.
+            "balance"     - cập nhật số dư.
+        """
         self._event_queue.put((kind, payload))
 
     def _poll_queue(self) -> None:
+        """Lấy hết sự kiện đang chờ và vẽ lên giao diện, rồi hẹn lần sau."""
         try:
             while True:
                 kind, payload = self._event_queue.get_nowait()
                 self._apply_event(kind, payload)
         except queue.Empty:
             pass
+
         self.root.after(100, self._poll_queue)
 
     def _apply_event(self, kind: str, payload) -> None:
+        """Áp dụng một sự kiện lên widget tương ứng."""
         if kind == "log":
             self._append_log(str(payload))
         elif kind == "role":
@@ -81,51 +146,66 @@ class AppWindow:
             self.balance_var.set(f"So du: {payload}")
 
     def _append_log(self, line: str) -> None:
+        """Thêm một dòng vào cuối History Log."""
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, line + "\n")
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
-    # ----------------------------------------------------------- Actions
+    # ------------------------------------------------------------------
+    # Thao tác của người dùng
+    # ------------------------------------------------------------------
 
     def _get_amount(self) -> Optional[int]:
+        """Đọc số tiền từ ô nhập. Trả về None nếu không hợp lệ."""
         text = self.amount_entry.get().strip()
+
         if not text.isdigit():
             messagebox.showerror("Loi", "So tien phai la so nguyen duong.")
             return None
+
         amount = int(text)
         if amount <= 0:
             messagebox.showerror("Loi", "So tien phai la so nguyen duong.")
             return None
+
         return amount
 
     def _handle_deposit(self) -> None:
+        """Xử lý khi bấm nút Nạp tiền."""
         amount = self._get_amount()
         if amount is None:
             return
-        if self.on_deposit:
-            self.on_deposit(amount)
-        else:
+
+        if self.on_deposit is None:
             self._append_log(f"[UI] Yeu cau nap {amount} (chua tich hop)")
+            return
+
+        self.on_deposit(amount)
 
     def _handle_withdraw(self) -> None:
+        """Xử lý khi bấm nút Rút tiền."""
         amount = self._get_amount()
         if amount is None:
             return
-        if self.on_withdraw:
-            self.on_withdraw(amount)
-        else:
+
+        if self.on_withdraw is None:
             self._append_log(f"[UI] Yeu cau rut {amount} (chua tich hop)")
+            return
+
+        self.on_withdraw(amount)
 
 
 def run_standalone(node_id: int = 0) -> None:
-    """Chay UI doc lap de kiem thu giao dien."""
+    """Chạy riêng giao diện để kiểm thử mà không cần mạng hay DB."""
     root = tk.Tk()
     app = AppWindow(root, node_id)
+
     app.post_event("log", f"UI khoi dong cho node {node_id}")
     app.post_event("role", "Node binh thuong")
     app.post_event("coordinator", "chua xac dinh")
     app.post_event("balance", "10,000,000")
+
     root.mainloop()
 
 
