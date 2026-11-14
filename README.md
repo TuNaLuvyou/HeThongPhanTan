@@ -51,25 +51,25 @@ python main.py --id <node_id>
 Trong đó `<node_id>` từ `0` đến `5`.
 Không cần nhập port hay bấm mở server trên UI, hệ thống tự gán port theo ID từ `config.json`.
 
-Node đầu tiên chạy một mình và tự làm điều phối viên ngay. Node tiếp theo gia nhập qua **một địa chỉ đang chạy**, không cần biết trước toàn bộ thành viên:
+TCP tự kết nối các IP/port trong `config.json` ở nền ngay khi mở node. Bully chạy ngay, không chờ thử kết nối xong và không chờ đủ máy. Trên máy thứ hai chỉ cần chạy:
 
 ```bash
-python main.py --id 2 --join 10.130.28.217:3000
+python main.py --id 2
 ```
 
-`--join` có thể trỏ tới node thường hoặc điều phối viên. Các node trao đổi ID, IP và port bằng `JOIN`/`JOIN_ACK`, rồi kết nối với các thành viên được giới thiệu. Không có `--join` thì node khởi tạo nhóm riêng. Nếu điểm gia nhập chưa mở, node thử lại mỗi 5 giây trong nền.
+Không cần tham số `--join`. Mỗi peer có một worker kết nối riêng; máy chưa mở hoặc vừa mất kết nối được thử lại sau 5 giây. Kết nối đang hoạt động được giữ lại, không gửi bắt tay lặp mỗi vòng. Khi nối TCP, các node tự trao ID và địa chỉ bằng `JOIN`/`JOIN_ACK`; đây là thông điệp nội bộ.
 
-Khi dùng chung DB, các node cần gia nhập cùng nhóm và chờ thống nhất điều phối viên trước khi giao dịch. Các node mở riêng không có điều phối viên chung.
+Khi dùng chung DB, cần chờ các node kết nối và thống nhất điều phối viên trước khi giao dịch. Nếu cấu hình chỉ có địa chỉ của chính mình hoặc các peer không truy cập được, node chưa thể biết các máy khác.
 
 ### Thử hai máy qua ZeroTier
 
 1. Các máy tham gia cùng mạng ZeroTier và được duyệt thiết bị.
-2. Trong `config.json`, điền **IP ZeroTier và port của chính máy đang chạy**, không điền Network ID hay Public IP. Mỗi máy chỉ cần mục cấu hình của ID mình; các mục khác nếu có không được quét khi khởi động. Cho phép Python nhận kết nối qua firewall.
+2. Trong `config.json`, điền **IP ZeroTier và port của các máy cần kết nối**, gồm máy đang chạy; dùng cùng danh sách địa chỉ trên các máy. Không điền Network ID hay Public IP. Cho phép Python nhận kết nối qua firewall.
 3. Cấu hình hiện tại dành cho Windows node `0` (`10.130.28.217:3000`) và macOS node `2` (`10.130.28.199:3002`). Các node còn lại đang dùng localhost, cần đổi IP trước khi chạy thêm máy.
-4. Windows chạy `python main.py --id 0`; macOS chạy `python3 main.py --id 2 --join 10.130.28.217:3000` (hoặc `python` nếu đã kích hoạt venv). Nếu Mac mở trước thì Windows dùng `--join 10.130.28.199:3002`.
+4. Windows chạy `python main.py --id 0`; macOS chạy `python3 main.py --id 2` (hoặc `python` nếu đã kích hoạt venv). Hai máy có thể mở theo thứ tự bất kỳ; TCP tự kết nối trong nền.
 5. Khi cả hai cùng hoạt động và kết nối thông suốt, hai giao diện phải cùng hiển thị điều phối viên `2`.
 
-Node bật Bully ngay, không thử kết nối danh sách cấu hình và không chờ đủ máy. Node có ID lớn nhất trong nhóm đã kết nối làm điều phối viên; node mới gia nhập được so ID để thống nhất vai trò.
+Node bật Bully ngay và tự kết nối TCP theo cấu hình trong nền, không chờ đủ máy. Node có ID lớn nhất trong nhóm đã kết nối làm điều phối viên; node mở sau được nhận biết mà không cần khởi động lại các node cũ.
 
 Giao diện dùng Tkinter/ttk với tiếng Việt có dấu: số dư quỹ, vai trò hiện tại, nhập tiền nạp/rút và nhật ký có thời gian. Sau giao dịch thành công, các node khác nhận thông báo TCP và đọc lại số dư từ DB. Thông báo này không được lưu để phát lại khi máy mất kết nối.
 
@@ -81,7 +81,7 @@ Nạp/rút mặc định chờ mô phỏng **3 giây sau khi đọc số dư, tr
 python -m unittest discover -s tests
 ```
 
-Trên macOS ngoài venv, dùng `python3`. Bộ test hiện có **53 test**, không yêu cầu DB thật hay mở cửa sổ, gồm kiểm thử nhiều luồng xin/trả quyền và đếm ngược trước khi ghi DB. Xem [kịch bản kiểm thử](docs/TESTING.md) để thử giao diện, DB và ZeroTier; xem [giao thức](docs/TECHS.md) và [luồng hoạt động](docs/FLOWS.md) để hiểu cách xử lý.
+Trên macOS ngoài venv, dùng `python3`. Bộ test hiện có **57 test**, không yêu cầu DB thật hay mở cửa sổ, gồm tự kết nối TCP theo cấu hình, node mở sau, nhiều luồng xin/trả quyền và đếm ngược trước khi ghi DB. Xem [kịch bản kiểm thử](docs/TESTING.md) để thử giao diện, DB và ZeroTier; xem [giao thức](docs/TECHS.md) và [luồng hoạt động](docs/FLOWS.md) để hiểu cách xử lý.
 
 Để chỉ xem giao diện, không kết nối DB hay mạng:
 

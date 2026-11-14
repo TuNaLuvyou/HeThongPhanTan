@@ -11,7 +11,7 @@ Trình tự khởi động:
     1. Đọc tham số --id và tìm cấu hình node trong config.json.
     2. Mở server TCP (bind port theo cấu hình).
     3. Mở cửa sổ Tkinter.
-    4. Bật Bully ngay; nếu có --join thì gia nhập qua địa chỉ đó trong nền.
+    4. Bật Bully ngay, tự kết nối các địa chỉ cấu hình trong nền.
     5. Chờ người dùng bấm Nạp/Rút.
 
 Cách chạy:
@@ -50,6 +50,9 @@ STATUS_UPDATE_INTERVAL = 2.0
 # Độ trễ mô phỏng sau khi đọc số dư, trước khi ghi; đặt 0 để tắt.
 TRANSACTION_DELAY = 3.0
 
+# Peer chưa mở hoặc vừa ngắt kết nối được thử lại độc lập trong nền.
+NETWORK_RETRY_INTERVAL = 5.0
+
 
 def load_config(path: str = "config.json") -> dict:
     """Đọc file cấu hình chung của dự án."""
@@ -87,7 +90,6 @@ class NodeRuntime:
         app: AppWindow,
         bank: BankService,
         bully: Bully,
-        join_address=None,
         transaction_delay=None,
     ):
         self.root = root
@@ -97,7 +99,6 @@ class NodeRuntime:
         self.app = app
         self.bank = bank
         self.bully = bully
-        self.join_address = join_address
         self.transaction_delay = max(0.0, float(
             TRANSACTION_DELAY if transaction_delay is None else transaction_delay
         ))
@@ -120,7 +121,7 @@ class NodeRuntime:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Khởi động độc lập; việc gia nhập không chặn bầu chọn hay UI."""
+        """Bật Bully ngay; tự kết nối TCP theo cấu hình trong nền."""
         self.app.on_deposit = lambda amount: self.request_transaction("DEPOSIT", amount)
         self.app.on_withdraw = lambda amount: self.request_transaction("WITHDRAW", amount)
 
@@ -147,7 +148,7 @@ class NodeRuntime:
         self.root.destroy()
 
     def _start_services(self) -> None:
-        """Chạy một mình ngay, chỉ liên hệ địa chỉ gia nhập nếu được cung cấp."""
+        """Không chờ các peer: bật Bully, sau đó duy trì TCP trong nền."""
         if self._stop_event.is_set():
             return
         self.bully.start()
@@ -155,20 +156,24 @@ class NodeRuntime:
             return
         self.update_status()
         self.refresh_balance_async()
-        if self.join_address is not None:
-            threading.Thread(target=self._join_cluster, daemon=True).start()
+        for node_config in self.config.get("nodes", []):
+            if self._stop_event.is_set():
+                return
+            if int(node_config["id"]) != self.node_id:
+                threading.Thread(
+                    target=self._maintain_peer_connection, args=(dict(node_config),), daemon=True,
+                ).start()
 
-    def _join_cluster(self) -> None:
-        """Thử lại một điểm gia nhập nếu máy đó chưa mở, không quét node khác."""
-        host, port = self.join_address
+    def _maintain_peer_connection(self, node_config: dict) -> None:
+        """Mỗi peer một worker để máy offline không làm chậm máy khác."""
+        peer_id = int(node_config["id"])
         while not self._stop_event.is_set():
             try:
-                if self.server.join(host, port):
-                    return
+                if not self.server.is_connected(peer_id):
+                    self.server.connect_configured_peer(node_config)
             except Exception as exc:
-                self._ui_log(f"Lỗi gia nhập tại {host}:{port}: {exc}")
-            self._ui_log(f"Chưa liên hệ được {host}:{port}, sẽ thử gia nhập lại")
-            if self._stop_event.wait(5):
+                self._ui_log(f"[Mạng] Lỗi kết nối tới nút {peer_id}: {exc}")
+            if self._stop_event.wait(NETWORK_RETRY_INTERVAL):
                 return
 
     def _periodic_update(self) -> None:
@@ -506,6 +511,11 @@ class NodeRuntime:
 
         if message_type in BULLY_MESSAGE_TYPES or message_type in ("JOIN", "JOIN_ACK"):
             if message_type in ("JOIN", "JOIN_ACK"):
+                member = message.get("node", {})
+                self._ui_log(
+                    f"[Mạng] Đã kết nối với nút {peer_id} "
+                    f"({member.get('ip')}:{member.get('port')})"
+                )
                 self.bully.on_peer_joined(int(peer_id))
             else:
                 self.bully.handle_message(node_id, message, peer_id, conn)
@@ -556,19 +566,8 @@ def main() -> None:
         description="Chạy một nút trong Hệ thống Quỹ chung Phân tán"
     )
     parser.add_argument("--id", type=int, required=True, help="ID của nút (0-5)")
-    parser.add_argument("--join", metavar="IP:PORT", help="Địa chỉ một nút đang chạy để gia nhập")
     args = parser.parse_args()
     node_id = args.id
-    join_address = None
-    if args.join:
-        try:
-            join_host, join_port = args.join.rsplit(":", 1)
-            join_port = int(join_port)
-            if not join_host or not 0 < join_port < 65536:
-                raise ValueError
-            join_address = (join_host, join_port)
-        except ValueError:
-            parser.error("--join phải có dạng IP:PORT với port từ 1 đến 65535")
 
     config = load_config()
     node_config = find_node_config(config, node_id)
@@ -607,7 +606,6 @@ def main() -> None:
         app=app,
         bank=bank,
         bully=bully,
-        join_address=join_address,
     )
     runtime.start()
 

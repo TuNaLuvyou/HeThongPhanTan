@@ -126,6 +126,12 @@ class FakeServer:
     def connect_to_peer(self, peer_id):
         return True
 
+    def is_connected(self, peer_id):
+        return peer_id in self.cluster.nodes and peer_id not in self.down_peers
+
+    def connect_configured_peer(self, node_config):
+        return self.connect_to_peer(int(node_config["id"]))
+
     def peer_ids(self):
         return sorted(nid for nid in self.cluster.nodes if nid != self.node_id)
 

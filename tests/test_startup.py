@@ -1,4 +1,4 @@
-"""Kiểm tra khởi động độc lập và đường gửi ngược cho node mở sau."""
+"""Bully chạy ngay, TCP tự kết nối theo cấu hình và không chặn UI."""
 
 import socket
 import threading
@@ -22,37 +22,68 @@ class StartupTest(unittest.TestCase):
         self.addCleanup(runtime._stop_event.set)
         return runtime
 
-    def test_starts_without_contacting_configured_nodes(self):
+    def test_bully_starts_before_background_connections_finish(self):
         runtime = self.make_runtime()
         elected = threading.Event()
-        runtime.bully.start.side_effect = elected.set
-        runtime.start()
-        self.assertTrue(elected.wait(1))
-        self.assertTrue(callable(runtime.app.on_deposit))
-        runtime.server.connect_to_peer.assert_not_called()
-        runtime.server.join.assert_not_called()
-        runtime.bully.start.assert_called_once()
-
-    def test_join_does_not_delay_local_election_and_shutdown_stops_retry(self):
-        runtime = self.make_runtime()
-        runtime.join_address = ("127.0.0.1", 3002)
         entered = threading.Event()
         release = threading.Event()
         self.addCleanup(release.set)
+        runtime.server.is_connected.return_value = False
 
-        def join(host, port):
-            runtime.bully.start.assert_called_once()
+        def connect(node_config):
+            self.assertTrue(elected.is_set())
             entered.set()
             release.wait(2)
             return False
 
-        runtime.server.join.side_effect = join
+        runtime.server.connect_configured_peer.side_effect = connect
+        runtime.bully.start.side_effect = elected.set
         runtime.start()
+        self.assertTrue(elected.wait(1))
+        self.assertTrue(entered.wait(1))
+        self.assertTrue(callable(runtime.app.on_deposit))
+        runtime.bully.start.assert_called_once()
+        release.set()
+
+    def test_close_during_background_connection_stops_retry(self):
+        runtime = self.make_runtime()
+        runtime.server.is_connected.return_value = False
+        entered = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def connect(node_config):
+            entered.set()
+            release.wait(2)
+            return False
+
+        runtime.server.connect_configured_peer.side_effect = connect
+        worker = threading.Thread(target=runtime._maintain_peer_connection, args=({"id": 2},))
+        worker.start()
         self.assertTrue(entered.wait(1))
         runtime.shutdown()
         release.set()
-        runtime.bully.start.assert_called_once()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        runtime.server.connect_configured_peer.assert_called_once_with({"id": 2})
+        runtime.bully.start.assert_not_called()
         runtime.bully.stop.assert_called_once()
+
+    def test_offline_peer_is_retried_without_restarting_bully(self):
+        runtime = self.make_runtime()
+        runtime.server.is_connected.return_value = False
+        runtime.server.connect_configured_peer.side_effect = [False, True]
+        with mock.patch.object(runtime._stop_event, "wait", side_effect=[False, True]):
+            runtime._maintain_peer_connection({"id": 2})
+        self.assertEqual(2, runtime.server.connect_configured_peer.call_count)
+        runtime.bully.start.assert_not_called()
+
+    def test_connected_peer_does_not_receive_repeated_handshakes(self):
+        runtime = self.make_runtime()
+        runtime.server.is_connected.return_value = True
+        with mock.patch.object(runtime._stop_event, "wait", return_value=True):
+            runtime._maintain_peer_connection({"id": 2})
+        runtime.server.connect_configured_peer.assert_not_called()
 
     def test_closed_node_does_not_start_services(self):
         runtime = self.make_runtime()

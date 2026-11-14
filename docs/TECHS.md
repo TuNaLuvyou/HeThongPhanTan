@@ -24,12 +24,13 @@
 - `main.py`: Trưởng nhóm (macOS ARM)
 
 ## 4. Cấu hình
-- `config.json` chứa cấu hình khởi động (`id`, `ip`, `port`, `os`); mỗi máy chỉ cần mục của chính ID mình. Các mục khác nếu có không được coi là thành viên đang tham gia.
+- `config.json` chứa cấu hình các node (`id`, `ip`, `port`, `os`). Mỗi máy dùng mục ID mình để mở server và các mục khác làm địa chỉ tự kết nối TCP ở nền. Có địa chỉ trong cấu hình không có nghĩa node đó đang online.
 - Port của node = giá trị trong config theo `--id`, tự bind khi khởi động.
 - Bind port thất bại (port đã bị chiếm hoặc IP trong `config.json` không phải IP máy đang chạy) thì `start_node()` trả `None` và node thoát ngay kèm thông báo lỗi; không mở giao diện chạy mà không có kết nối.
-- Sau khi đăng ký handler và mở UI, node bật Bully ngay. Khi chưa phát hiện thành viên nào thì tự làm coordinator ngay. Không kiểm tra danh sách cấu hình và không chờ đủ máy.
-- Tham số tuỳ chọn `--join IP:PORT` chỉ định một thành viên bất kỳ để gia nhập. `JOIN`/`JOIN_ACK` trao địa chỉ, hình thành danh sách thành viên trong bộ nhớ và kết nối tới các thành viên được giới thiệu. Không có `--join` thì tạo nhóm riêng. Điểm gia nhập chưa sẵn sàng được thử lại mỗi 5 giây trong nền.
-- `NetworkServer.peer_ids()` cung cấp ID đã phát hiện; `join(host, port)` gia nhập; `send()` tự kết nối lại tới địa chỉ thành viên đã biết khi cần gửi. Không suy ID từ IP. IP tự công bố phải là địa chỉ các máy khác truy cập được (IP ZeroTier khi chạy nhiều máy).
+- Sau khi đăng ký handler và mở UI, node bật Bully ngay. Khi chưa phát hiện thành viên nào thì tự làm coordinator ngay. Không chờ kết nối TCP hoàn tất và không chờ đủ máy.
+- Runtime tạo một worker cho mỗi địa chỉ peer trong cấu hình. Worker mở TCP trong nền và thử lại peer chưa kết nối sau `NETWORK_RETRY_INTERVAL = 5.0` giây; không bắt tay lại nếu đường kết nối đang hoạt động. Đóng ứng dụng dừng các vòng thử lại. Không cần và không còn tham số dòng lệnh `--join`.
+- `JOIN`/`JOIN_ACK` là bắt tay nội bộ sau khi mở TCP để trao ID, địa chỉ và thành viên đã biết. Các địa chỉ được giới thiệu cũng có thể được dùng để mở thêm kết nối.
+- `NetworkServer.peer_ids()` cung cấp ID đã phát hiện; `connect_configured_peer(node_config)` mở TCP theo cấu hình; `is_connected(peer_id)` kiểm tra đường gửi còn mở; `send()` tự kết nối lại tới địa chỉ thành viên đã biết khi cần gửi. Không suy ID từ IP. IP tự công bố phải là địa chỉ các máy khác truy cập được (IP ZeroTier khi chạy nhiều máy).
 - Kết nối nhận được định danh bằng `from` cũng được dùng làm đường gửi ngược nếu chưa có đường gửi tới peer, hỗ trợ node tham gia sau khi coordinator đã chạy.
 
 ## 5. Giao thức
@@ -101,6 +102,7 @@
 - Bố cục hai cột: nhật ký cuộn dọc bên trái; số dư, vai trò/điều phối viên, nhập số tiền và đếm ngược bên phải. Thời điểm cập nhật số dư là lúc giao diện nhận kết quả đọc DB, không phải thời gian commit giao dịch.
 - Luồng nền chỉ gửi sự kiện qua `post_event()`; Tkinter xử lý hàng đợi ở luồng chính.
 - Nhật ký giao diện có giờ và màu theo thông báo. Log file `logs/node_<id>.log` lưu UTF-8, log terminal dùng UTF-8 để tránh lỗi mã hoá tiếng Việt trên Windows.
+- Khi nhận `JOIN` hoặc `JOIN_ACK` hợp lệ, cả hai phía ghi lên nhật ký giao diện thông báo kết nối kèm ID, IP và port của thành viên. Log này được tạo từ bắt tay thực tế, không chỉ từ việc có IP trong cấu hình.
 - Thư mục `logs/` và file log được tự tạo khi có sự kiện; không cần giữ trong cây mã nguồn. Cache `__pycache__/` do Python tự tạo. Cả cache, log và môi trường `venv/` được bỏ qua trong Git.
 - Hướng dẫn và giới hạn kiểm thử nằm trong [TESTING.md](TESTING.md).
 
@@ -111,7 +113,7 @@
 - JSON phân tách bằng `\n`.
 - Bully với `ELECTION` / `ANSWER` / `COORDINATOR` + heartbeat.
 - ID lớn hơn thắng.
-- Khởi động độc lập; gia nhập qua một địa chỉ `--join`, trao ID và địa chỉ bằng `JOIN`/`JOIN_ACK`, không quét danh sách node trước khi chạy (chốt theo yêu cầu người dùng).
+- Khởi động Bully ngay, đồng thời TCP tự kết nối theo cấu hình trong nền; không chờ các lần kết nối xong mới chạy Bully. Chỉ cần `--id`, không cần `--join`. `JOIN`/`JOIN_ACK` là thông điệp mạng nội bộ.
 - Khoá tập trung tại coordinator (`REQUEST` / `GRANT` / `RELEASE`).
 - Tên thông điệp cấp quyền đã bỏ hậu tố/tiền tố `LOCK`; phản hồi xếp hàng là `QUEUED`.
 - Số dư trong DB Supabase.

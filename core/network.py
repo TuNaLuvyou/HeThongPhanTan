@@ -271,8 +271,24 @@ class NetworkServer:
                 "peers": self._membership()}
 
     def join(self, host: str, port: int) -> bool:
-        """Gia nhập qua một địa chỉ đã biết; không quét danh sách cấu hình."""
+        """Mở TCP và trao thông tin thành viên qua một địa chỉ cụ thể."""
         return self._connect_address(host, port)
+
+    def is_connected(self, peer_id: int) -> bool:
+        """Cho worker nền biết có cần thử mở lại đường TCP tới peer không."""
+        with self._lock:
+            conn = self._clients.get(peer_id)
+            return conn is not None and not conn._closed
+
+    def connect_configured_peer(self, node_config: dict) -> bool:
+        """Dùng địa chỉ cấu hình để mở TCP; không tự bầu hay chờ đủ node."""
+        peer_id = int(node_config["id"])
+        if peer_id == self.node_id:
+            return False
+        return self._connect_address(
+            node_config.get("ip", DEFAULT_HOST),
+            int(node_config.get("port", 3000 + peer_id)), peer_id,
+        )
 
     def set_message_handler(self, handler: Callable) -> None:
         """Đăng ký hàm xử lý gói tin.
