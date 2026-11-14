@@ -26,6 +26,7 @@
 - **Xem History Log**: Theo dõi tiến trình bầu chọn, xin/được cấp/trả quyền, và các giao dịch.
 - **Đồng bộ số dư giữa các máy**: sau giao dịch thành công, node thông báo để các node khác đọc lại số dư từ DB. Node không nhận được thông báo có thể còn hiển thị số dư cũ; khi mở lại ứng dụng sẽ đọc số dư hiện tại.
 - **Giao diện tối giản bằng tiếng Việt**: số dư được làm nổi bật, hiển thị vai trò và điều phối viên; nhật ký có thời gian và màu phân biệt thành công/lỗi.
+- **Quan sát giao dịch**: sau khi được cấp quyền và đọc số dư, nạp/rút có thời gian mô phỏng 3 giây với đếm ngược trên giao diện. Node khác có thể xin quyền và thấy trạng thái xếp hàng; node đang giao dịch không nhận thêm thao tác nạp/rút tới khi hoàn tất.
 
 ## 5. Quy tắc nghiệp vụ
 - **Kiểm tra số dư**: Không rút vượt quá số dư hiện có.

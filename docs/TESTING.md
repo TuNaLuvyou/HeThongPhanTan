@@ -17,8 +17,10 @@ Trên macOS ngoài venv, thay `python` bằng `python3`.
 | `tests/test_balance_sync.py` | 8 | Thông báo số dư sau giao dịch thành công, bỏ qua giao dịch lỗi, retry gửi, kết nối đọc DB riêng và TCP khi rảnh |
 | `tests/test_startup.py` | 4 | Không quét cấu hình, gia nhập không chặn bầu chọn, đóng node và đường gửi ngược trên socket nhận |
 | `tests/test_membership.py` | 5 | TCP thật: chạy riêng, ID cao/thấp gia nhập, gia nhập qua follower để phát hiện mesh, bầu lại khi mất coordinator, kết nối lại thành viên |
+| `tests/test_concurrent_access.py` | 3 | Nhiều luồng xin quyền đồng thời chỉ cấp một node, giữ FIFO khi trả quyền đồng thời có yêu cầu mới, bỏ qua trả quyền sai người |
+| `tests/test_transaction_delay.py` | 7 | Nạp/rút đếm ngược trước khi ghi, thay đổi/tắt delay, đóng khi đang chờ, rút vượt số dư, FIFO hoạt động trong lúc delay, GRANT lặp và hai thao tác đồng thời |
 
-Kết quả đã kiểm tra trên Windows: **43 test thành công**. Bộ test không mở giao diện và không truy cập DB thật; test mạng dùng `socketpair()` và TCP localhost. Kết quả này chưa xác nhận giao diện thực tế, Supabase và kết nối nhiều máy qua ZeroTier.
+Kết quả đã kiểm tra trên Windows: **53 test thành công**. Bộ test không mở giao diện và không truy cập DB thật; test mạng dùng `socketpair()` và TCP localhost. Đếm ngược được kiểm tra bằng đồng hồ giả để không phải chờ 3 giây trong mỗi test; riêng kiểm thử giao diện Tkinter ẩn với DB giả lập đã xác nhận cả nạp/rút hiển thị đếm 3 → 2 → 1 → 0 và bật lại hai nút sau giao dịch. Chưa xác nhận Supabase và kết nối nhiều máy qua ZeroTier.
 
 ## 2. Điều kiện trước khi thử nhiều máy
 
@@ -63,6 +65,7 @@ Gọi số dư trước khi thử là `B`. Dùng giá trị thực tế trong DB
 | Node 0 nạp 100000 | DB tăng thành `B + 100000`, có một bản ghi DEPOSIT; cả hai giao diện cập nhật khi nhận thông báo và đọc DB thành công |
 | Node 2 rút 50000 | Nếu đủ tiền, DB còn `B + 50000` và có một bản ghi WITHDRAW |
 | Hai máy cùng nạp 100000 và 200000 | Xin quyền lần lượt; tổng số dư tăng 300000, có đủ hai giao dịch |
+| Bấm nạp/rút, rồi bấm giao dịch ở node khác trong 3 giây | Node được cấp quyền hiển thị đếm ngược; node còn lại hiện xếp hàng. Sau giao dịch đầu, node kế tiếp mới bắt đầu đếm. Hai nút trên mỗi node được mở lại khi giao dịch của node đó kết thúc |
 | Nhập 0, số âm hoặc chữ | Giao diện từ chối, không ghi giao dịch |
 | Rút vượt số dư | Giao dịch bị từ chối; vẫn trả khoá để giao dịch tiếp theo chạy được |
 | Để ứng dụng rảnh hơn 5 giây, sau đó giao dịch | Luồng nhận TCP vẫn hoạt động, máy khác nhận được thông báo số dư |

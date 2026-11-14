@@ -73,13 +73,15 @@ Node bật Bully ngay, không thử kết nối danh sách cấu hình và khôn
 
 Giao diện dùng Tkinter/ttk với tiếng Việt có dấu: số dư quỹ, vai trò hiện tại, nhập tiền nạp/rút và nhật ký có thời gian. Sau giao dịch thành công, các node khác nhận thông báo TCP và đọc lại số dư từ DB. Thông báo này không được lưu để phát lại khi máy mất kết nối.
 
+Nạp/rút mặc định chờ mô phỏng **3 giây sau khi đọc số dư, trước khi ghi DB**, hiển thị đếm ngược trên giao diện để quan sát người giữ quyền và FIFO. Node đang xếp hàng chỉ hiện chờ quyền; khi được cấp mới bắt đầu đếm. Hai nút giao dịch của node đang chờ/đang chạy được vô hiệu hoá; giao diện và các node khác vẫn hoạt động. Đổi `TRANSACTION_DELAY` trong `main.py` nếu cần thời gian khác, hoặc đặt `0` để tắt. Mutex nội bộ chỉ bảo vệ trạng thái cấp quyền, không giữ trong thời gian mô phỏng.
+
 ### Kiểm thử
 
 ```bash
 python -m unittest discover -s tests
 ```
 
-Trên macOS ngoài venv, dùng `python3`. Bộ test hiện có **43 test**, không yêu cầu DB thật hay mở cửa sổ. Xem [kịch bản kiểm thử](docs/TESTING.md) để thử giao diện, DB và ZeroTier; xem [giao thức](docs/TECHS.md) và [luồng hoạt động](docs/FLOWS.md) để hiểu cách xử lý.
+Trên macOS ngoài venv, dùng `python3`. Bộ test hiện có **53 test**, không yêu cầu DB thật hay mở cửa sổ, gồm kiểm thử nhiều luồng xin/trả quyền và đếm ngược trước khi ghi DB. Xem [kịch bản kiểm thử](docs/TESTING.md) để thử giao diện, DB và ZeroTier; xem [giao thức](docs/TECHS.md) và [luồng hoạt động](docs/FLOWS.md) để hiểu cách xử lý.
 
 Để chỉ xem giao diện, không kết nối DB hay mạng:
 

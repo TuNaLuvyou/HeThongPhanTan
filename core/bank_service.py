@@ -18,8 +18,9 @@ Tài liệu tham chiếu: docs/TECHS.md (mục 7, 8), docs/FLOWS.md (mục 4, 5)
 """
 
 import os
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import psycopg2
 
@@ -61,6 +62,8 @@ class BankService:
         self._conn = None
         self._lock_holder: Optional[int] = None
         self._lock_queue: list = []
+        # Chỉ giữ mutex khi đổi trạng thái cấp quyền, không giữ lúc giao dịch.
+        self._access_mutex = threading.Lock()
 
     # ------------------------------------------------------------------
     # Kết nối DB
@@ -96,19 +99,25 @@ class BankService:
         - GRANTED: khoá đang rảnh (hoặc chính node này đang giữ), cấp ngay.
         - QUEUED : node khác đang giữ khoá, node này được xếp vào hàng đợi.
         """
-        lock_is_free = self._lock_holder is None
-        already_holds_lock = self._lock_holder == node_id
+        with self._access_mutex:
+            lock_is_free = self._lock_holder is None
+            already_holds_lock = self._lock_holder == node_id
+            if lock_is_free or already_holds_lock:
+                self._lock_holder = node_id
+                result = GRANTED
+            else:
+                self._lock_queue.append(node_id)
+                result = QUEUED
+            holder = self._lock_holder
+            queue_snapshot = list(self._lock_queue)
 
-        if lock_is_free or already_holds_lock:
-            self._lock_holder = node_id
-            log_event(node_id, "GRANTED", f"Nút giữ quyền: {node_id}")
-            return GRANTED
-
-        self._lock_queue.append(node_id)
+        if result == GRANTED:
+            log_event(node_id, "GRANTED", f"Nút giữ quyền: {holder}")
+            return result
         log_event(
             node_id,
             "QUEUED",
-            f"Nút giữ quyền: {self._lock_holder}; hàng đợi: {self._lock_queue}",
+            f"Nút giữ quyền: {holder}; hàng đợi: {queue_snapshot}",
         )
         return QUEUED
 
@@ -118,16 +127,14 @@ class BankService:
         Trả về ID của node kế tiếp trong hàng đợi FIFO, hoặc None nếu hàng đợi
         rỗng. Nếu người gọi không phải node đang giữ khoá thì bỏ qua.
         """
-        if self._lock_holder != holder_id:
+        with self._access_mutex:
+            if self._lock_holder != holder_id:
+                return None
+            # Trả quyền và chuyển sang người kế tiếp trong cùng một lần giữ mutex.
+            next_holder = self._lock_queue.pop(0) if self._lock_queue else None
+            self._lock_holder = next_holder
+        if next_holder is None:
             return None
-
-        self._lock_holder = None
-
-        if not self._lock_queue:
-            return None
-
-        next_holder = self._lock_queue.pop(0)
-        self._lock_holder = next_holder
         log_event(next_holder, "GRANTED", f"Nút giữ quyền: {next_holder}")
         return next_holder
 
@@ -137,17 +144,20 @@ class BankService:
         Hàng đợi cũ thuộc về coordinator cũ. Nếu giữ lại, coordinator mới sẽ
         cấp quyền cho những node không còn chờ được nữa (FLOWS mục 3).
         """
-        lock_is_empty = self._lock_holder is None and not self._lock_queue
-        if lock_is_empty:
-            return
+        with self._access_mutex:
+            lock_is_empty = self._lock_holder is None and not self._lock_queue
+            if lock_is_empty:
+                return
+            old_holder = self._lock_holder
+            old_queue = list(self._lock_queue)
+            self._lock_holder = None
+            self._lock_queue = []
 
         log_event(
             -1,
             "ACCESS_RESET",
-            f"Nút giữ quyền cũ: {self._lock_holder}; hàng đợi cũ: {self._lock_queue}",
+            f"Nút giữ quyền cũ: {old_holder}; hàng đợi cũ: {old_queue}",
         )
-        self._lock_holder = None
-        self._lock_queue = []
 
     # ------------------------------------------------------------------
     # Đọc và ghi số dư
@@ -165,7 +175,7 @@ class BankService:
         finally:
             conn.close()
 
-    def deposit(self, node_id: int, amount: int) -> bool:
+    def deposit(self, node_id: int, amount: int, before_write: Optional[Callable[[], None]] = None) -> bool:
         """Nạp tiền vào quỹ: balance += amount, ghi một dòng DEPOSIT."""
         if not self._is_valid_amount(amount):
             log_event(node_id, "DEPOSIT_INVALID", f"Số tiền không hợp lệ: {amount}")
@@ -177,6 +187,12 @@ class BankService:
             # Cách này để lộ mất cập nhật nếu khoá loại trừ bị tắt, phục vụ demo.
             balance = self._read_balance(cursor, INITIAL_BALANCE)
             new_balance = balance + amount
+            if before_write is not None:
+                try:
+                    before_write()
+                except Exception:
+                    conn.rollback()
+                    raise
 
             cursor.execute(
                 "UPDATE fund SET balance = %s, updated_at = now() WHERE id = 1",
@@ -192,7 +208,7 @@ class BankService:
         log_event(node_id, "DEPOSIT_OK", f"Nạp {amount:,}; số dư mới: {new_balance:,}")
         return True
 
-    def withdraw(self, node_id: int, amount: int) -> bool:
+    def withdraw(self, node_id: int, amount: int, before_write: Optional[Callable[[], None]] = None) -> bool:
         """Rút tiền khỏi quỹ nếu đủ số dư, ghi một dòng WITHDRAW.
 
         Trả về False nếu số tiền không hợp lệ hoặc số dư không đủ.
@@ -214,6 +230,12 @@ class BankService:
                 return False
 
             new_balance = balance - amount
+            if before_write is not None:
+                try:
+                    before_write()
+                except Exception:
+                    conn.rollback()
+                    raise
 
             cursor.execute(
                 "UPDATE fund SET balance = %s, updated_at = now() WHERE id = 1",

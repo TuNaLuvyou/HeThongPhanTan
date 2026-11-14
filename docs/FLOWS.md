@@ -32,15 +32,16 @@ Khi nhận gói tin đầu tiên có trường `from`, server lưu kết nối n
 ## 4. Nạp/Rút
 1. Node gửi `REQUEST` cho coordinator.
 2. Coordinator cấp `GRANT` nếu khoá đang rảnh; nếu đang có node khác giữ thì đưa node vào hàng đợi FIFO và trả `QUEUED` ("đã nhận đơn, đang xếp hàng").
+   - Coordinator dùng mutex nội bộ để kiểm tra/cập nhật người giữ quyền và FIFO; nhả mutex ngay sau đó, không giữ suốt giao dịch. Nhiều yêu cầu đến đồng thời chỉ có một node được cấp quyền ngay; thứ tự FIFO theo thứ tự vào hàng đợi, không theo ID.
 3. `GRANT` hoặc `QUEUED` đều được tính là coordinator đã phản hồi; node ngừng đồng hồ phát hiện coordinator lỗi (FLOWS mục 2b). Thiếu cả hai phản hồi quá `REQUEST_REPLY_TIMEOUT` (10 giây) thì node bầu lại.
-4. Node được cấp quyền tự đọc số dư từ DB, tính giá trị mới, ghi lại và ghi vào bảng `transactions`. Code hiện chưa có bước chờ giả lập; coordinator chỉ quản lý quyền, không thực hiện giao dịch thay node khác.
+4. Node được cấp quyền tự đọc số dư từ DB, tính giá trị mới, đếm ngược 3 → 2 → 1 → 0 giây rồi mới ghi số dư và bảng `transactions`. Nhãn giao dịch hiển thị loại nạp/rút, số tiền và thời gian còn lại. Khi chỉ đang xếp hàng thì hiển thị chờ quyền, chưa đếm ngược. Hai nút nạp/rút của node đó bị vô hiệu hoá tới khi trả quyền hoặc huỷ đơn chờ; các node khác vẫn bấm xin quyền bình thường.
 5. Node gửi `RELEASE` cho coordinator. Nếu bản thân node đang là coordinator thì tự giải phóng khoá trực tiếp (không gửi qua mạng cho chính mình).
 6. Coordinator nhận `RELEASE`, bỏ node giữ quyền và cấp `GRANT` cho node kế tiếp trong hàng đợi FIFO.
 7. Trường hợp node giữ quyền crash mà không gửi `RELEASE`: code hiện chưa thu hồi khoá — các node đã nhận `QUEUED` chờ vô hạn (CẦN CHỐT, xem TECHS mục 9c).
 
 Sau giao dịch thành công và trả khoá, nút gửi `BALANCE_CHANGED` tới các nút khác. Nút nhận đọc lại số dư từ DB trong luồng nền, rồi cập nhật giao diện qua hàng đợi. Giao dịch thất bại không gửi thông báo; các nút nhận không gửi tiếp thông báo này.
 
-> **Lưu ý cho luồng 4**: Code dùng trình tự đọc, tính, ghi giá trị đã tính; không dùng UPDATE kiểu `balance = balance + x`. Nếu cần thêm độ trễ để minh hoạ mất cập nhật khi tắt điều phối thì phải bổ sung riêng, hiện chưa có chức năng này.
+> **Lưu ý cho luồng 4**: Code dùng trình tự đọc, tính, chờ mô phỏng, ghi giá trị đã tính; không dùng UPDATE kiểu `balance = balance + x`. Thời gian chờ lấy từ `TRANSACTION_DELAY` trong `main.py`; mặc định 3 giây, đặt 0 để tắt. Chờ chạy trong worker, không chặn Tkinter, heartbeat hoặc mutex quản lý FIFO. Chưa có công tắc tắt điều phối.
 
 ## 5. Rút vượt số dư
 1. Sau khi nhận quyền và đọc số dư từ DB, phát hiện số dư không đủ.

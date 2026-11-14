@@ -80,7 +80,11 @@
 
 - `BankService._lock_holder`: `None` là rảnh, có ID là đang bận và chỉ rõ node giữ quyền; tương đương vai trò biến `busy`, không có một biến `busy` riêng.
 - `BankService._lock_queue`: danh sách chờ FIFO, lấy phần tử đầu khi người giữ quyền gửi `RELEASE`.
+- `_access_mutex` bảo vệ toàn bộ bước kiểm tra/cập nhật holder và FIFO trong `request_lock()`, `release_lock()`, `reset_lock()`. Khi trả quyền, việc lấy node kế tiếp và gán holder là một thao tác được bảo vệ; mutex được nhả trước khi ghi log, gửi mạng hoặc chạy giao dịch.
 - Giao dịch lỗi vẫn đi qua `finally` để trả quyền. `RELEASE` từ node không giữ quyền bị bỏ qua. Nhận `GRANT` khi không còn giao dịch chờ thì trả quyền ngay.
+- `TRANSACTION_DELAY = 3.0` trong `main.py` là độ trễ demo, đặt `0` để tắt. Runtime truyền callback `before_write` cho `deposit()`/`withdraw()`; callback chạy sau khi đọc số dư và kiểm tra đủ tiền, trước khi UPDATE/INSERT. Trong lúc chờ, node vẫn giữ quyền nhưng không giữ `_access_mutex`, nên coordinator vẫn tiếp nhận yêu cầu để xếp FIFO.
+- Sự kiện `transaction_status` hiển thị chờ quyền, xếp hàng, đếm ngược theo thời gian còn lại và kết quả. `transaction_busy` vô hiệu hoá hai nút giao dịch trong lúc có đơn đang chờ/đang chạy và mở lại sau khi trả quyền hoặc huỷ đơn chờ. Đếm ngược chỉ bắt đầu khi được cấp quyền và đã đọc số dư; rút vượt số dư bị từ chối ngay.
+- `_transaction_running` ngăn `GRANT` lặp tạo thêm worker khi giao dịch đang chạy. Đơn đang chạy không bị xoá như một đơn chỉ đang xếp hàng. Đóng node trong lúc đếm ngược làm callback báo huỷ và rollback trước khi ghi.
 - Chưa có lease, chống yêu cầu trùng hoặc kiểm tra đầy đủ người gửi `GRANT`/`QUEUED`. Phần đổi tên thông điệp chưa bổ sung các cơ chế chịu lỗi này.
 
 ## 7. CSDL hiện tại
@@ -94,7 +98,7 @@
 ### Giao diện và log
 
 - Tkinter/ttk, theme `clam`, dùng phông hệ thống; không thêm thư viện giao diện bên ngoài.
-- Bố cục gồm số dư, vai trò/điều phối viên, nhập số tiền và nhật ký. Thời điểm cập nhật số dư là lúc giao diện nhận kết quả đọc DB, không phải thời gian commit giao dịch.
+- Bố cục hai cột: nhật ký cuộn dọc bên trái; số dư, vai trò/điều phối viên, nhập số tiền và đếm ngược bên phải. Thời điểm cập nhật số dư là lúc giao diện nhận kết quả đọc DB, không phải thời gian commit giao dịch.
 - Luồng nền chỉ gửi sự kiện qua `post_event()`; Tkinter xử lý hàng đợi ở luồng chính.
 - Nhật ký giao diện có giờ và màu theo thông báo. Log file `logs/node_<id>.log` lưu UTF-8, log terminal dùng UTF-8 để tránh lỗi mã hoá tiếng Việt trên Windows.
 - Thư mục `logs/` và file log được tự tạo khi có sự kiện; không cần giữ trong cây mã nguồn. Cache `__pycache__/` do Python tự tạo. Cả cache, log và môi trường `venv/` được bỏ qua trong Git.
@@ -125,4 +129,4 @@
 - **d.** Xử lý khi đổi coordinator giữa chừng: CẦN CHỐT phần còn lại. Code hiện đã làm: coordinator cũ xoá holder + hàng đợi FIFO khi hạ vai trò (`BankService.reset_lock()`, log `ACCESS_RESET`), coordinator mới bắt đầu với hàng đợi trống; node đang chờ mà phát hiện đổi coordinator thì đơn xin bị huỷ và báo người dùng bấm lại (`main.py::NodeRuntime.update_status`). Còn bỏ ngỏ: code KHÔNG tự động gửi lại `REQUEST` như đề xuất cũ của mục này — cần chốt giữa "huỷ + báo bấm lại" (đang dùng) với "tự gửi lại" (đề xuất cũ).
 - **e.** Có thêm kiểm tra phiên bản (version) khi ghi DB làm lớp bảo vệ phụ hay không.
 - **f.** Driver DB (psycopg2-binary hay psycopg 3) và có tách file `core/db.py` hay không. (Ghi nhận: code hiện dùng `psycopg2`.)
-- **g.** Chức năng demo bổ sung: công tắc "tắt khoá" (minh hoạ mất cập nhật), nút giả lập crash, độ trễ mô phỏng xử lý khi nạp/rút.
+- **g.** Đã bổ sung độ trễ mô phỏng 3 giây và đếm ngược cho nạp/rút theo yêu cầu. Công tắc "tắt khoá" và nút giả lập crash chưa triển khai.

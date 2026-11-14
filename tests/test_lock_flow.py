@@ -26,11 +26,15 @@ class FakeBank(BankService):
     def _connect(self):
         raise AssertionError("Test khong duoc phep cham DB")
 
-    def deposit(self, node_id, amount):
+    def deposit(self, node_id, amount, before_write=None):
+        if before_write:
+            before_write()
         self._record("DEPOSIT", node_id, amount)
         return not self.fail
 
-    def withdraw(self, node_id, amount):
+    def withdraw(self, node_id, amount, before_write=None):
+        if before_write:
+            before_write()
         self._record("WITHDRAW", node_id, amount)
         return not self.fail
 
@@ -160,6 +164,7 @@ class Cluster:
             Bully=lambda srv, nid: bully,
             BankService=lambda: bank,
             log_event=lambda *args, **kwargs: None,
+            TRANSACTION_DELAY=0,
         ):
             with mock.patch.object(app_main.sys, "argv", ["main.py", "--id", str(node_id)]):
                 app_main.main()

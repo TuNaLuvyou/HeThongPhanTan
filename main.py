@@ -20,6 +20,7 @@ Cách chạy:
 
 import argparse
 import json
+import math
 import sys
 import threading
 import time
@@ -45,6 +46,9 @@ REQUEST_REPLY_TIMEOUT = 10.0
 
 # Chu kỳ của vòng cập nhật trạng thái nền.
 STATUS_UPDATE_INTERVAL = 2.0
+
+# Độ trễ mô phỏng sau khi đọc số dư, trước khi ghi; đặt 0 để tắt.
+TRANSACTION_DELAY = 3.0
 
 
 def load_config(path: str = "config.json") -> dict:
@@ -84,6 +88,7 @@ class NodeRuntime:
         bank: BankService,
         bully: Bully,
         join_address=None,
+        transaction_delay=None,
     ):
         self.root = root
         self.node_id = node_id
@@ -93,6 +98,9 @@ class NodeRuntime:
         self.bank = bank
         self.bully = bully
         self.join_address = join_address
+        self.transaction_delay = max(0.0, float(
+            TRANSACTION_DELAY if transaction_delay is None else transaction_delay
+        ))
 
         # Bảo vệ ba biến _pending_* vì chúng bị nhiều thread cùng đọc/ghi.
         self._pending_lock = threading.Lock()
@@ -101,6 +109,7 @@ class NodeRuntime:
         self._pending_type = None
         self._pending_amount = 0
         self._pending_sent_at = None
+        self._transaction_running = False
 
         # Coordinator gần nhất mà node này biết, dùng để phát hiện đổi
         # coordinator giữa chừng.
@@ -196,7 +205,7 @@ class NodeRuntime:
         self.app.post_event("coordinator", coordinator_text)
 
         with self._pending_lock:
-            is_waiting = self._pending_type is not None
+            is_waiting = self._pending_type is not None and not self._transaction_running
 
         # Chỉ coi là "đổi coordinator" khi đã từng biết coordinator cũ.
         # Lần đầu (giá trị None) không tính, tránh huỷ oan đơn vừa gửi.
@@ -251,13 +260,15 @@ class NodeRuntime:
     def _cancel_pending(self, reason: str) -> None:
         """Huỷ đơn xin quyền đang chờ và báo người dùng bấm lại."""
         with self._pending_lock:
-            if self._pending_type is None:
+            if self._pending_type is None or self._transaction_running:
                 return
             self._pending_type = None
             self._pending_amount = 0
             self._pending_sent_at = None
 
         self._ui_log(f"[Khoá] Huỷ giao dịch đang chờ ({reason}), vui lòng bấm lại")
+        self.app.post_event("transaction_status", "Giao dịch đã huỷ, vui lòng bấm lại")
+        self.app.post_event("transaction_busy", False)
 
     def _mark_acknowledged(self) -> None:
         """Coordinator đã phản hồi: ngừng đếm thời gian chờ."""
@@ -308,6 +319,9 @@ class NodeRuntime:
         # Đơn này gửi tới coordinator hiện tại, nên mốc so sánh "đổi
         # coordinator" phải là người này.
         self._last_coordinator_id = coordinator_id
+        action = "nạp" if tx_type == "DEPOSIT" else "rút"
+        self.app.post_event("transaction_busy", True)
+        self.app.post_event("transaction_status", f"Đang chờ quyền {action} {amount:,} VND…")
         self._ui_log(
             f"Gửi yêu cầu xin quyền tới điều phối viên {coordinator_id} "
             f"({'nạp' if tx_type == 'DEPOSIT' else 'rút'} {amount:,})"
@@ -339,6 +353,7 @@ class NodeRuntime:
 
         if requester == self.node_id:
             self._mark_acknowledged()
+            self.app.post_event("transaction_status", "Đang xếp hàng chờ quyền giao dịch…")
         else:
             self.server.send(requester, {"type": "QUEUED", "from": self.node_id})
 
@@ -355,8 +370,12 @@ class NodeRuntime:
         self._mark_acknowledged()
 
         with self._pending_lock:
+            if self._transaction_running:
+                return
             tx_type = self._pending_type
             amount = self._pending_amount
+            if tx_type:
+                self._transaction_running = True
 
         if not tx_type:
             self._ui_log("[Khoá] Nhận quyền nhưng không còn giao dịch chờ, trả quyền ngay")
@@ -369,6 +388,7 @@ class NodeRuntime:
             f"[Khoá] Được cấp quyền, thực hiện "
             f"{'nạp' if tx_type == 'DEPOSIT' else 'rút'} {amount:,}"
         )
+        self.app.post_event("transaction_status", "Đã được cấp quyền, đang đọc số dư…")
 
         transaction_thread = threading.Thread(
             target=self._do_transaction,
@@ -377,26 +397,51 @@ class NodeRuntime:
         )
         transaction_thread.start()
 
+    def _wait_transaction_delay(self, tx_type: str, amount: int) -> None:
+        """Đếm theo đồng hồ thực trong luồng giao dịch, UI chỉ nhận sự kiện."""
+        action = "nạp" if tx_type == "DEPOSIT" else "rút"
+        deadline = time.monotonic() + self.transaction_delay
+        while True:
+            if self._stop_event.is_set():
+                raise RuntimeError("Nút đã dừng, huỷ giao dịch trước khi ghi")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.app.post_event(
+                "transaction_status",
+                f"Đang {action} {amount:,} VND — còn {math.ceil(remaining)} giây",
+            )
+            self._stop_event.wait(min(1.0, remaining))
+        self.app.post_event(
+            "transaction_status", f"Đang {action} {amount:,} VND — còn 0 giây, đang ghi dữ liệu…",
+        )
+
     def _do_transaction(self, tx_type: str, amount: int) -> None:
         """Thực hiện giao dịch sau khi đã được cấp quyền (chạy ở thread nền)."""
         succeeded = False
         try:
             if tx_type == "DEPOSIT":
-                succeeded = self.bank.deposit(self.node_id, amount)
+                succeeded = self.bank.deposit(
+                    self.node_id, amount, before_write=lambda: self._wait_transaction_delay(tx_type, amount),
+                )
                 if succeeded:
                     message = f"Nạp {amount:,} thành công"
                 else:
                     message = f"Nạp {amount:,} thất bại"
             else:
-                succeeded = self.bank.withdraw(self.node_id, amount)
+                succeeded = self.bank.withdraw(
+                    self.node_id, amount, before_write=lambda: self._wait_transaction_delay(tx_type, amount),
+                )
                 if succeeded:
                     message = f"Rút {amount:,} thành công"
                 else:
                     message = f"Rút {amount:,} thất bại (số dư không đủ hoặc số tiền không hợp lệ)"
 
             self._ui_log(f"[Giao dịch] {message}")
+            self.app.post_event("transaction_status", message)
         except Exception as exc:
             self._ui_log(f"[Giao dịch] Lỗi giao dịch: {exc}")
+            self.app.post_event("transaction_status", f"Giao dịch thất bại: {exc}")
         finally:
             # Xoá đơn TRƯỚC khi trả khoá. Nếu trả khoá trước, coordinator có
             # thể cấp quyền lại cho chính node này và giao dịch chạy lặp.
@@ -404,9 +449,13 @@ class NodeRuntime:
                 self._pending_type = None
                 self._pending_amount = 0
                 self._pending_sent_at = None
+                self._transaction_running = False
 
-            self.release_lock()
-            self.refresh_balance_async()
+            try:
+                self.release_lock()
+            finally:
+                self.app.post_event("transaction_busy", False)
+                self.refresh_balance_async()
 
         if succeeded:
             self._broadcast_balance_changed()
@@ -490,6 +539,10 @@ class NodeRuntime:
 
         if message_type == "QUEUED":
             self._mark_acknowledged()
+            with self._pending_lock:
+                is_waiting = self._pending_type is not None and not self._transaction_running
+            if is_waiting:
+                self.app.post_event("transaction_status", "Đang xếp hàng chờ quyền giao dịch…")
             sender = message.get("from")
             self._ui_log(
                 f"[Khoá] Điều phối viên {sender} đã nhận đơn, đang xếp hàng chờ quyền"

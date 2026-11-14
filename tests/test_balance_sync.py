@@ -28,7 +28,8 @@ class BalanceSyncTest(unittest.TestCase):
             app = FakeAppWindow(FakeRoot(), node_id)
             bank = FakeBank()
             bully = FakeBully(server, node_id, coordinator=5)
-            runtime = NodeRuntime(FakeRoot(), node_id, CONFIG, server, app, bank, bully)
+            runtime = NodeRuntime(FakeRoot(), node_id, CONFIG, server, app, bank, bully,
+                                  transaction_delay=0)
             server.set_message_handler(runtime.on_message)
             self.runtimes[node_id] = runtime
             self.cluster.nodes[node_id] = _Node(node_id, server, app, bank, bully)
