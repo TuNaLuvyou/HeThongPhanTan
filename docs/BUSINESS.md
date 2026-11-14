@@ -10,9 +10,9 @@
 
 ## 2a. Khởi động và gia nhập
 - Node mở server và chạy Bully ngay. Chưa biết thành viên nào thì tự làm coordinator.
-- Node vào nhóm dùng `--join IP:PORT` để liên hệ một thành viên đang chạy; không có bước thử toàn bộ danh sách cấu hình trước khi chạy Bully.
+- TCP tự kết nối các IP/port trong `config.json` ở nền ngay khi mở ứng dụng, thử lại peer chưa mở sau 5 giây; không cần tham số `--join` và không chờ các lần kết nối hoàn tất trước khi chạy Bully.
 - Các thành viên trao đổi ID và địa chỉ, rồi thống nhất coordinator theo ID. Chuyển vai trò trong ứng dụng đang chạy, không cần khởi động lại.
-- Không truyền `--join` thì tạo nhóm riêng. Các nhóm chưa kết nối không có một coordinator chung; khi dùng chung DB, cần gia nhập cùng nhóm và chờ thống nhất vai trò trước khi giao dịch.
+- Các máy cần có địa chỉ của nhau trong cấu hình và kết nối TCP thông suốt. Trước khi thống nhất vai trò, các node chưa kết nối có thể tạm thời tự làm coordinator; cần đợi vai trò ổn định trước khi giao dịch chung DB.
 
 ## 3. Quỹ chung
 - Số dư lưu trong CSDL (Supabase Postgres).

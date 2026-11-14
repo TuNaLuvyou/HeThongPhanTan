@@ -3,10 +3,10 @@
 ## 1. Khởi động node
 1. Đọc tham số `--id` và cấu hình từ `config.json`.
 2. Tự bind port của mình theo cấu hình.
-3. Bật Bully ngay, không quét danh sách cấu hình. Chưa biết thành viên nào thì tự làm coordinator ngay, không chờ 5 giây.
-4. Nếu có `--join IP:PORT`, liên hệ địa chỉ đó trong nền và trao `JOIN`/`JOIN_ACK` (ID, IP, port của mình và các thành viên đã biết). Nếu không liên hệ được, thử lại mỗi 5 giây cho tới khi kết nối được hoặc node đóng.
+3. Bật Bully ngay. Chưa biết thành viên nào thì tự làm coordinator ngay, không chờ 5 giây và không chờ kết nối TCP hoàn tất.
+4. Tự mở TCP tới các IP/port peer trong `config.json`, mỗi peer một worker nền. Peer chưa mở hoặc mất kết nối được thử lại sau 5 giây; peer đang kết nối được bỏ qua. Không cần `--join`. Khi TCP nối được, tự trao `JOIN`/`JOIN_ACK` (ID, IP, port của mình và các thành viên đã biết).
 5. Từ các địa chỉ được giới thiệu, kết nối tới các thành viên khác. Coordinator gặp ID thấp hơn gửi `COORDINATOR`; gặp ID cao hơn gửi `ELECTION` để node đó công bố/bầu chọn. Node thường chỉ yêu cầu bầu chọn khi chưa biết coordinator hoặc gặp ID cao hơn coordinator, không huỷ đơn chờ chỉ vì có node ID thấp hơn gia nhập.
-6. Bầu chọn và heartbeat chỉ dùng danh sách thành viên đã phát hiện trong lúc chạy. Không truyền `--join` thì node tạo nhóm riêng; hai nhóm chỉ thống nhất sau khi có kết nối gia nhập giữa chúng.
+6. Bầu chọn và heartbeat dùng danh sách thành viên đã phát hiện trong lúc chạy; địa chỉ trong cấu hình là đầu mối kết nối, không phải bằng chứng online. Node mở sau được nhận biết qua worker thử lại và bắt tay, không cần khởi động lại các node cũ.
 
 Khi nhận gói tin đầu tiên có trường `from`, server lưu kết nối nhận làm đường gửi ngược nếu chưa có kết nối tới node đó. Vì vậy node đang chạy có thể gửi heartbeat/cấp quyền tới node vừa mở mà không cần khởi động lại. Nếu đóng ứng dụng khi đang kết nối hoặc bầu chọn, node không được khởi động Bully lại hay tự nhận điều phối viên sau khi đã dừng.
 
@@ -24,7 +24,7 @@ Khi nhận gói tin đầu tiên có trường `from`, server lưu kết nối n
 8. Khi đã theo một coordinator ID cao hơn, bỏ qua công bố ID thấp đến trễ từ vòng gia nhập trước. Khi watchdog thực sự bầu lại, coordinator cũ được xoá để có thể nhận node ID thấp hơn thay thế.
 
 ## 3. Node ID cao hơn tham gia mạng
-1. Node mới gia nhập bằng `--join` tới một thành viên bất kỳ. Các node trao địa chỉ, so ID và thống nhất coordinator có ID lớn nhất trong nhóm. Không có thành viên ID cao hơn thì tự làm coordinator ngay; nếu có, gửi `ELECTION` và chờ tối đa 5 giây để nhận `ANSWER`.
+1. Node mới mở với `--id`, TCP tự kết nối các địa chỉ trong cấu hình ở nền. Các node trao địa chỉ, so ID và thống nhất coordinator có ID lớn nhất trong nhóm. Không có thành viên ID cao hơn thì tự làm coordinator ngay; nếu có, gửi `ELECTION` và chờ tối đa 5 giây để nhận `ANSWER`.
 2. Coordinator cũ nhận `COORDINATOR` từ node có ID lớn hơn thì hạ vai trò xuống thành node bình thường (ghi log `STEP_DOWN`) và xoá trạng thái khoá: node giữ quyền + hàng đợi FIFO bị đặt về rỗng (`BankService.reset_lock()`, log `ACCESS_RESET`) vì hàng đợi cũ không còn ai trả lời. Coordinator mới bắt đầu với hàng đợi trống.
 3. Ngược lại, coordinator đang tại vị nhận `ELECTION` từ node ID thấp hơn thì KHÔNG hạ vai trò: trả `ANSWER` + `COORDINATOR` cho node kia theo lại (TECHS mục 6, FLOWS mục 2.4).
 4. Đơn xin quyền còn treo ở coordinator cũ: node đang chờ phát hiện đổi coordinator thì đơn bị huỷ và UI báo bấm lại; việc tự động gửi lại `REQUEST` cho coordinator mới CHƯA có — còn chờ chốt ở TECHS mục 9d.
