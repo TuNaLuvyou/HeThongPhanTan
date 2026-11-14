@@ -506,6 +506,11 @@ class NodeRuntime:
 
         if message_type in BULLY_MESSAGE_TYPES or message_type in ("JOIN", "JOIN_ACK"):
             if message_type in ("JOIN", "JOIN_ACK"):
+                member = message.get("node", {})
+                self._ui_log(
+                    f"[Mạng] Đã kết nối với nút {peer_id} "
+                    f"({member.get('ip')}:{member.get('port')})"
+                )
                 self.bully.on_peer_joined(int(peer_id))
             else:
                 self.bully.handle_message(node_id, message, peer_id, conn)

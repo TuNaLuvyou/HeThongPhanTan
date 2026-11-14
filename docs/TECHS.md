@@ -101,6 +101,7 @@
 - Bố cục hai cột: nhật ký cuộn dọc bên trái; số dư, vai trò/điều phối viên, nhập số tiền và đếm ngược bên phải. Thời điểm cập nhật số dư là lúc giao diện nhận kết quả đọc DB, không phải thời gian commit giao dịch.
 - Luồng nền chỉ gửi sự kiện qua `post_event()`; Tkinter xử lý hàng đợi ở luồng chính.
 - Nhật ký giao diện có giờ và màu theo thông báo. Log file `logs/node_<id>.log` lưu UTF-8, log terminal dùng UTF-8 để tránh lỗi mã hoá tiếng Việt trên Windows.
+- Khi nhận `JOIN` hoặc `JOIN_ACK` hợp lệ, cả hai phía ghi lên nhật ký giao diện thông báo kết nối kèm ID, IP và port của thành viên. Việc chỉ mở node riêng mà không có `--join` không tạo thông báo gia nhập ở nhóm khác.
 - Thư mục `logs/` và file log được tự tạo khi có sự kiện; không cần giữ trong cây mã nguồn. Cache `__pycache__/` do Python tự tạo. Cả cache, log và môi trường `venv/` được bỏ qua trong Git.
 - Hướng dẫn và giới hạn kiểm thử nằm trong [TESTING.md](TESTING.md).
 

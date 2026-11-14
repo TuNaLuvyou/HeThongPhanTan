@@ -61,6 +61,14 @@ class MembershipTest(unittest.TestCase):
         self.assertEqual([], old.bank._lock_queue)
         self.assertEqual([2], old.server.peer_ids())
         self.assertEqual([0], new.server.peer_ids())
+        self.assertTrue(wait_until(lambda: any(
+            f"[Mạng] Đã kết nối với nút 2 (127.0.0.1:{new.server.port})" == message
+            for message in old.app.logs()
+        ), timeout=3))
+        self.assertTrue(wait_until(lambda: any(
+            f"[Mạng] Đã kết nối với nút 0 (127.0.0.1:{old.server.port})" == message
+            for message in new.app.logs()
+        ), timeout=3))
 
     def test_lower_id_joins_and_follows_existing_coordinator(self):
         high = self.node(5)
