@@ -71,6 +71,18 @@ class BankService:
             log_event(next_holder, "LOCK_GRANTED", f"holder={next_holder}")
         return next_holder
 
+    def reset_lock(self) -> None:
+        """Xoa toan bo trang thai khoa khi node khong con la coordinator (FLOWS muc 3).
+
+        Hang doi cu thuoc ve coordinator cu; neu giu lai thi coordinator moi se cap quyen
+        dua tren danh sach ma khong node nao con nhan duoc GRANT_LOCK.
+        """
+        if self._lock_holder is None and not self._lock_queue:
+            return
+        log_event(-1, "LOCK_RESET", f"holder={self._lock_holder} queue={self._lock_queue}")
+        self._lock_holder = None
+        self._lock_queue = []
+
     # --------------------------------------------------------- So du + GD
 
     def get_balance(self) -> int:
