@@ -1,5 +1,22 @@
-# core/bully.py - Thanh vien 2 (macOS ARM) - Giai thuat Bully: ELECTION, ANSWER, COORDINATOR, heartbeat, phat hien coordinator loi
-# Doc tham chieu: docs/TECHS.md (muc 2, 6, 8), docs/FLOWS.md (muc 1, 2, 3), docs/BUSINESS.md
+# core/bully.py - Thành viên 2 (macOS ARM)
+"""Giải thuật Bully để bầu coordinator cho mạng 6 node.
+
+Ý tưởng: node có ID lớn nhất còn sống sẽ là coordinator.
+
+Mỗi node nằm ở một trong ba trạng thái:
+    IDLE        - node bình thường, đang theo một coordinator.
+    ELECTING    - đang chạy bầu chọn, chờ ANSWER từ các node ID lớn hơn.
+    COORDINATOR - node này đang giữ vai trò coordinator.
+
+Các gói tin Bully dùng trong file này:
+    ELECTION      : node bắt đầu bầu cử gửi cho các node ID lớn hơn.
+    ANSWER        : node ID lớn hơn trả lời "tao còn sống".
+    COORDINATOR   : node thắng cử thông báo cho toàn mạng.
+    HEARTBEAT     : coordinator gửi định kỳ để chứng minh còn sống.
+    HEARTBEAT_ACK : node phụ trả lời heartbeat.
+
+Tài liệu tham chiếu: docs/TECHS.md (mục 2, 6, 8), docs/FLOWS.md (mục 1, 2, 3).
+"""
 
 import threading
 import time
@@ -12,264 +29,392 @@ from core.network import (
     log_event,
 )
 
+# Tên các loại gói tin Bully.
 ELECTION = "ELECTION"
 ANSWER = "ANSWER"
 COORDINATOR = "COORDINATOR"
 HEARTBEAT = "HEARTBEAT"
 HEARTBEAT_ACK = "HEARTBEAT_ACK"
 
-# Cac gia tri thoi gian duoi day thuoc muc 9b trong docs/TECHS.md (CẦN CHỐT).
-ELECTION_ANSWER_TIMEOUT = 5.0  # Thoi gian toi da cho ANSWER tu node co ID lon hon.
-HEARTBEAT_INTERVAL = 2.0  # Chu ky gui HEARTBEAT va chu ky kiem tra cua vong canh.
-HEARTBEAT_TIMEOUT = 3.0  # Ngan nay khong co HEARTBEAT_ACK thi coi peer da offline (chi de ghi log).
-COORDINATOR_SILENCE_TIMEOUT = 6.0  # Ngan nay khong co dau hieu coordinator con song thi bau lai.
+# ---------------------------------------------------------------------------
+# Tham số thời gian (đơn vị: giây) - thuộc mục 9b trong docs/TECHS.md.
+# ---------------------------------------------------------------------------
+
+# Chờ tối đa bao lâu để nhận ANSWER từ các node ID lớn hơn.
+ELECTION_ANSWER_TIMEOUT = 5.0
+
+# Chu kỳ coordinator gửi HEARTBEAT và chu kỳ vòng canh kiểm tra.
+HEARTBEAT_INTERVAL = 2.0
+
+# Peer không trả HEARTBEAT_ACK quá lâu thì coi là offline (chỉ để ghi log).
+HEARTBEAT_TIMEOUT = 3.0
+
+# Coordinator im lặng quá lâu thì node phụ bầu lại (FLOWS mục 2a).
+COORDINATOR_SILENCE_TIMEOUT = 6.0
 
 
 class Bully:
-    """Giai thuat Bully: id lon hon thang.
+    """Giải thuật Bully cho một node.
 
-    - Node co ID lon nhat con song giu vai tro coordinator.
-    - Coordinator gui HEARTBEAT dinh ky de cac node khac biet minh con song.
-    - Node phu phat hien coordinator loi khi coordinator im lang qua lau (FLOWS muc 2a)
-      roi tu bat dau bau cua lai.
-
-    Interface de module khac goi: start, stop, is_coordinator, trigger_election,
-    handle_message, coordinator_id, state.
+    Các hàm module khác được dùng:
+        start()             - bật vòng canh và bầu coordinator lần đầu.
+        stop()              - tắt vòng canh, không nhận vai trò nữa.
+        is_coordinator()    - node này có đang là coordinator không.
+        trigger_election()  - chủ động bầu lại khi phát hiện coordinator lỗi.
+        handle_message()    - xử lý một gói tin Bully nhận từ mạng.
+        coordinator_id      - ID coordinator hiện tại (None nếu chưa biết).
+        state               - trạng thái hiện tại của node.
     """
 
     def __init__(self, server: NetworkServer, node_id: int):
         self.server = server
         self.node_id = node_id
+
         self.coordinator_id: Optional[int] = None
         self.state = "IDLE"  # IDLE | ELECTING | COORDINATOR
+
+        # Các node ID lớn hơn đã trả ANSWER trong cuộc bầu cử đang chạy.
         self._election_answers: dict = {}
+
+        # Thời điểm nhận HEARTBEAT_ACK gần nhất của từng peer.
         self._last_heartbeat_ack: dict = {}
+
+        # Chuỗi peer còn sống lần trước, dùng để tránh ghi log lặp lại.
         self._liveness_logged = ""
+
+        # Bảo vệ các biến trạng thái được nhiều thread cùng đọc/ghi.
         self._election_lock = threading.Lock()
+
         self._loop_thread: Optional[threading.Thread] = None
         self._running = False
         self._stopped = False
-        # Thoi diem gan nhat thay dau hieu coordinator con song (HEARTBEAT hoac COORDINATOR).
+
+        # Lần gần nhất thấy dấu hiệu coordinator còn sống
+        # (nhận HEARTBEAT hoặc COORDINATOR).
         self._last_coordinator_seen = time.monotonic()
 
-    # ------------------------------------------------------------------ API
+    # ------------------------------------------------------------------
+    # API cho các module khác
+    # ------------------------------------------------------------------
 
     def start(self) -> bool:
-        """Bat dau lop Bully: chay vong canh va bau chon coordinator dau tien."""
-        if self._running:
-            return True
-        self._running = True
-        self._stopped = False
-        self._loop_thread = threading.Thread(target=self._main_loop, daemon=True)
-        self._loop_thread.start()
+        """Bật vòng canh nền và bắt đầu bầu coordinator lần đầu."""
+        with self._election_lock:
+            if self._stopped:
+                return False
+            if self._running:
+                return True
+            self._running = True
+            # Thời gian kết nối peer không được tính là coordinator im lặng.
+            self._last_coordinator_seen = time.monotonic()
+            self._loop_thread = threading.Thread(target=self._main_loop, daemon=True)
+            self._loop_thread.start()
+
         self._start_election("STARTUP")
         return True
 
     def stop(self) -> None:
-        """Dung vong canh va danh dau node da chu dong roi mang."""
-        self._running = False
-        self._stopped = True
+        """Tắt vòng canh và đánh dấu node đã chủ động rời mạng."""
+        with self._election_lock:
+            self._running = False
+            self._stopped = True
+
         if self._loop_thread is not None:
             self._loop_thread.join(timeout=HEARTBEAT_INTERVAL)
 
     def is_coordinator(self) -> bool:
+        """Trả về True nếu node này đang là coordinator."""
         return self.state == "COORDINATOR"
 
     def trigger_election(self, reason: str = "MANUAL") -> None:
-        """Module khac (main.py) goi khi phat hien coordinator khong phan hoi."""
+        """Bầu lại khi module khác phát hiện coordinator không phản hồi."""
         self._start_election(reason)
 
-    # ------------------------------------------------------------- BAU CU
+    # ------------------------------------------------------------------
+    # Bầu chọn
+    # ------------------------------------------------------------------
 
     def _peer_ids(self) -> list:
-        """Danh sach ID cac node (khong phai node hien tai) trong cau hinh."""
+        """Trả về danh sách ID của các node khác trong config.json."""
+        config = load_config()
         peer_ids = []
-        for node in load_config().get("nodes", []):
-            peer_id = int(node.get("id"))
+        for node_config in config.get("nodes", []):
+            peer_id = int(node_config.get("id"))
             if peer_id != self.node_id:
                 peer_ids.append(peer_id)
         return peer_ids
 
     def _start_election(self, reason: str = "") -> None:
-        """Chay thuong qua bau cua Bully: gui ELECTION cho node ID lon hon roi xem ANSWER.
+        """Chạy một cuộc bầu cử theo giải thuật Bully.
 
-        Quy tac (FLOWS muc 1.5 va 2.3):
-        - Co node ID lon hon tra loi ANSWER -> dung lai, cho node do cong bo COORDINATOR.
-        - Khong co ANSWER nao trong ELECTION_ANSWER_TIMEOUT -> chinh minh la coordinator.
+        Quy tắc (FLOWS mục 1.5 và 2.3):
+        - Gửi ELECTION cho mọi node có ID lớn hơn.
+        - Nếu có node trả ANSWER: dừng lại, chờ node đó công bố COORDINATOR.
+        - Nếu không ai trả lời trong ELECTION_ANSWER_TIMEOUT: tự làm coordinator.
         """
         if self._stopped:
-            # User da chu dong tat cua so thi node coi như roi mang, khong duoc gianh lai vai tro.
-            log_event(self.node_id, "IGNORE_AFTER_STOP", f"type=ELECTION reason={reason}")
+            # Người dùng đã đóng cửa sổ: node coi như đã rời mạng.
+            log_event(self.node_id, "IGNORE_AFTER_STOP", "Bỏ qua yêu cầu bầu chọn vì nút đã dừng")
             return
+
         with self._election_lock:
             if self.state in ("ELECTING", "COORDINATOR"):
-                # Da co cuoc bau dang chay, hoac minh dang la coordinator ID cao nhat.
+                # Đang có cuộc bầu cử khác chạy, hoặc mình đã là coordinator.
                 return
             self.state = "ELECTING"
             self.coordinator_id = None
             self._election_answers = {}
-        self._last_coordinator_seen = time.monotonic()
-        log_event(self.node_id, "ELECTION_START", f"from_node={self.node_id} reason={reason}")
 
-        higher_ids = sorted(p for p in self._peer_ids() if p > self.node_id)
-        for peer_id in higher_ids:
-            sent = self.server.send(peer_id, {"type": ELECTION, "from": self.node_id})
-            if not sent:
-                log_event(self.node_id, "ELECTION_SEND_FAIL", f"peer={peer_id}")
+        self._last_coordinator_seen = time.monotonic()
+        reason_text = {
+            "STARTUP": "khởi động nút",
+            "WATCHDOG": "không nhận được phản hồi từ điều phối viên",
+            "REQUEST_LOCK_NO_REPLY": "yêu cầu xin quyền không được phản hồi",
+            "REQUEST_LOCK_SEND_FAIL": "không gửi được yêu cầu xin quyền",
+            "MANUAL": "yêu cầu thủ công",
+        }.get(reason, reason)
+        if reason.startswith("ELECTION_FROM_"):
+            reason_text = f"nhận yêu cầu bầu chọn từ nút {reason.removeprefix('ELECTION_FROM_')}"
+        log_event(self.node_id, "ELECTION_START", f"Nút {self.node_id}; lý do: {reason_text}")
+
+        # Chỉ các node có ID lớn hơn mới có quyền trả lời.
+        higher_peer_ids = []
+        for peer_id in self._peer_ids():
+            if peer_id > self.node_id:
+                higher_peer_ids.append(peer_id)
+        higher_peer_ids.sort()
+
+        for peer_id in higher_peer_ids:
+            payload = {"type": ELECTION, "from": self.node_id}
+            if not self.server.send(peer_id, payload):
+                log_event(self.node_id, "ELECTION_SEND_FAIL", f"Nút nhận: {peer_id}")
 
         deadline = time.monotonic() + ELECTION_ANSWER_TIMEOUT
-        yielded_to = None
+        answered_peer_ids = []
+
         while True:
             with self._election_lock:
-                if self.state != "ELECTING":
-                    # Co node khac da cong bo COORDINATOR trong luc minh cho.
+                if self._stopped or self.state != "ELECTING":
+                    # Một node khác đã công bố COORDINATOR trong lúc mình chờ.
                     return
-                answered_ids = sorted(pid for pid, ok in self._election_answers.items() if ok)
-                if answered_ids:
+
+                answered_peer_ids = []
+                for peer_id, answered in self._election_answers.items():
+                    if answered:
+                        answered_peer_ids.append(peer_id)
+                answered_peer_ids.sort()
+
+                if answered_peer_ids:
                     self.state = "IDLE"
                     self._last_coordinator_seen = time.monotonic()
-                    yielded_to = answered_ids
-            if yielded_to is not None:
-                log_event(self.node_id, "ELECTION_YIELD", f"higher_alive={yielded_to}")
+
+            if answered_peer_ids:
+                log_event(self.node_id, "ELECTION_YIELD", f"Các nút ID cao hơn đang hoạt động: {answered_peer_ids}")
                 return
+
             if time.monotonic() >= deadline:
                 break
+
             time.sleep(0.05)
 
         with self._election_lock:
-            if self.state != "ELECTING":
+            if self._stopped or self.state != "ELECTING":
                 return
             self.coordinator_id = self.node_id
             self.state = "COORDINATOR"
             self._last_coordinator_seen = time.monotonic()
             self._last_heartbeat_ack = {}
-        log_event(self.node_id, "BECOME_COORDINATOR", f"node={self.node_id}")
+
+        log_event(self.node_id, "BECOME_COORDINATOR", f"Điều phối viên mới: nút {self.node_id}")
         self._broadcast_coordinator()
 
     def _broadcast_coordinator(self) -> None:
-        """Cong bo minh la coordinator toi tat ca cac node khac."""
+        """Thông báo cho tất cả các node biết mình là coordinator."""
         for peer_id in self._peer_ids():
-            self.server.send(peer_id, {"type": COORDINATOR, "from": self.node_id})
+            payload = {"type": COORDINATOR, "from": self.node_id}
+            self.server.send(peer_id, payload)
 
-    # ------------------------------------------------------- VONG CANH
+    # ------------------------------------------------------------------
+    # Vòng canh nền
+    # ------------------------------------------------------------------
 
     def _main_loop(self) -> None:
-        """Vong canh chay lien tuc: coordinator thi goi heartbeat, node phu thi theo doi coordinator.
+        """Vòng lặp chạy suốt thời gian node hoạt động.
 
-        Vong nay phai chay o moi vai tro, neu khong node phu khong the phat hien coordinator loi.
+        - Nếu là coordinator: gửi HEARTBEAT định kỳ.
+        - Nếu là node phụ: theo dõi xem coordinator còn sống không.
+        - Nếu đang bầu cử: không làm gì, để cuộc bầu cử tự chạy.
         """
         while self._running:
             if self.state == "COORDINATOR":
                 self._send_heartbeats()
             elif self.state != "ELECTING":
                 self._watch_coordinator()
+
             time.sleep(HEARTBEAT_INTERVAL)
 
     def _send_heartbeats(self) -> None:
-        """Coordinator gui HEARTBEAT toi tung peer de chung minh minh con song."""
+        """Coordinator gửi HEARTBEAT cho từng peer để chứng minh còn sống."""
         for peer_id in self._peer_ids():
-            # Peer khong phan hoi chi co nghia la node do offline, khong phai loi coordinator,
-            # nen khong duoc phep bat bau cua tu day.
-            self.server.send(peer_id, {"type": HEARTBEAT, "from": self.node_id})
+            # Peer không trả lời chỉ có nghĩa node đó offline, không phải lỗi
+            # của coordinator, nên không được bầu lại từ đây.
+            payload = {"type": HEARTBEAT, "from": self.node_id}
+            self.server.send(peer_id, payload)
+
         self._log_liveness()
 
     def _log_liveness(self) -> None:
-        """Ghi danh sach peer con phan hoi heartbeat, chi ghi khi danh sach thay doi."""
+        """Ghi log danh sách peer còn phản hồi heartbeat.
+
+        Chỉ ghi khi danh sách thay đổi, tránh spam log mỗi 2 giây.
+        """
         now = time.monotonic()
-        alive = sorted(
-            pid for pid in self._peer_ids() if now - self._last_heartbeat_ack.get(pid, 0.0) <= HEARTBEAT_TIMEOUT
+        alive_peer_ids = []
+
+        for peer_id in self._peer_ids():
+            last_ack = self._last_heartbeat_ack.get(peer_id, 0.0)
+            if now - last_ack <= HEARTBEAT_TIMEOUT:
+                alive_peer_ids.append(peer_id)
+
+        alive_peer_ids.sort()
+        snapshot = ",".join(str(peer_id) for peer_id in alive_peer_ids)
+
+        if snapshot == self._liveness_logged:
+            return
+
+        self._liveness_logged = snapshot
+        log_event(
+            self.node_id,
+            "PEERS_ALIVE",
+            f"Điều phối viên: {self.node_id}; các nút phản hồi: [{snapshot}]",
         )
-        snapshot = ",".join(str(pid) for pid in alive)
-        if snapshot != self._liveness_logged:
-            self._liveness_logged = snapshot
-            log_event(self.node_id, "PEERS_ALIVE", f"coordinator={self.node_id} alive=[{snapshot}]")
 
     def _watch_coordinator(self) -> None:
-        """Node phu phat hien coordinator loi theo FLOWS muc 2a: im lang qua COORDINATOR_SILENCE_TIMEOUT."""
+        """Phát hiện coordinator chết vì im lặng quá lâu (FLOWS mục 2a)."""
         if self.state == "COORDINATOR":
             return
-        if time.monotonic() - self._last_coordinator_seen <= COORDINATOR_SILENCE_TIMEOUT:
+
+        silence_duration = time.monotonic() - self._last_coordinator_seen
+        if silence_duration <= COORDINATOR_SILENCE_TIMEOUT:
             return
+
         if self.coordinator_id is not None:
-            log_event(self.node_id, "COORDINATOR_FAIL", f"coordinator={self.coordinator_id} silent")
+            log_event(
+                self.node_id,
+                "COORDINATOR_FAIL",
+                f"Không nhận phản hồi từ điều phối viên {self.coordinator_id}",
+            )
         else:
-            log_event(self.node_id, "NO_COORDINATOR", "yielded but no COORDINATOR announced")
+            log_event(
+                self.node_id,
+                "NO_COORDINATOR",
+                "Đã nhường bầu chọn nhưng chưa nhận thông báo điều phối viên",
+            )
+
         self._start_election("WATCHDOG")
 
-    # --------------------------------------------------------- HANDLER
+    # ------------------------------------------------------------------
+    # Xử lý gói tin nhận từ mạng
+    # ------------------------------------------------------------------
 
     def handle_message(
-        self, node_id: int, message: dict, peer_id: Optional[int], conn: ClientConnection
+        self,
+        node_id: int,
+        message: dict,
+        peer_id: Optional[int],
+        conn: ClientConnection,
     ) -> None:
-        """Nhan message tu NetworkServer -> dispatch theo type."""
-        msg_type = message.get("type")
-        sender_id = peer_id if peer_id is not None else message.get("from")
+        """Nhận một gói tin từ NetworkServer và chuyển tới hàm xử lý phù hợp."""
+        message_type = message.get("type")
+
+        sender_id = peer_id
+        if sender_id is None:
+            sender_id = message.get("from")
         if sender_id is not None:
             sender_id = int(sender_id)
 
-        if msg_type == ELECTION:
+        if message_type == ELECTION:
             self._on_election(sender_id, conn)
-        elif msg_type == ANSWER:
+        elif message_type == ANSWER:
             self._on_answer(sender_id)
-        elif msg_type == COORDINATOR:
+        elif message_type == COORDINATOR:
             self._on_coordinator_announce(sender_id)
-        elif msg_type == HEARTBEAT:
+        elif message_type == HEARTBEAT:
             self._on_heartbeat(sender_id, conn)
-        elif msg_type == HEARTBEAT_ACK:
+        elif message_type == HEARTBEAT_ACK:
             self._on_heartbeat_ack(sender_id)
 
     def _on_election(self, sender_id: Optional[int], conn: ClientConnection) -> None:
-        """Xu ly ELECTION theo quy tac Bully: chi node co ID LON HON moi tra ANSWER.
+        """Xử lý ELECTION theo luật Bully: chỉ node ID lớn hơn mới trả ANSWER.
 
-        Node khoi dong bao gio cung gui ELECTION len cac node ID lon hon minh, va chi can
-        biet trong so do co ai con song. Vi vay:
-        - Minh la node cao hon (sender < minh): tra ANSWER de node kia chiu dung lai,
-          roi chinh minh bat dau bau cua tiep (FLOWS muc 2.3).
-        - Minh la coordinator: tra them COORDINATOR de node kia theo lai ngay, neu khong
-          no se tu phong minh va hai node cung la coordinator.
-        - Sender la node cao hon minh: khong co gi can tra loi.
+        Ba trường hợp:
+        - Node gửi có ID nhỏ hơn mình: trả ANSWER, rồi tự bầu cử tiếp.
+          Nếu mình đang là coordinator thì gửi thêm COORDINATOR để node kia
+          theo lại ngay, tránh hai coordinator cùng tồn tại.
+        - Node gửi có ID lớn hơn mình: không cần trả lời.
+        - Không xác định được node gửi: bỏ qua.
         """
         if sender_id is None or sender_id >= self.node_id:
             return
+
         conn.send({"type": ANSWER, "from": self.node_id, "to": sender_id})
+
         if self.state == "COORDINATOR":
             conn.send({"type": COORDINATOR, "from": self.node_id})
             return
+
         self._start_election(f"ELECTION_FROM_{sender_id}")
 
     def _on_answer(self, sender_id: Optional[int]) -> None:
-        """Ghi nhan node ID lon hon con song va dang trong tieu bau cua minh."""
+        """Ghi nhận một node ID lớn hơn còn sống trong cuộc bầu cử hiện tại."""
         if sender_id is None or sender_id <= self.node_id:
             return
+
         with self._election_lock:
             if self.state == "ELECTING":
                 self._election_answers[sender_id] = True
 
     def _on_coordinator_announce(self, sender_id: Optional[int]) -> None:
-        """Nhan cong bo COORDINATOR: chi theo node co ID lon hon minh (ID lon hon thang)."""
+        """Nhận thông báo COORDINATOR từ node thắng cử.
+
+        Chỉ chấp nhận node có ID lớn hơn mình (ID lớn hơn thắng).
+        """
         if sender_id is None or sender_id <= self.node_id:
             return
+
         if self._stopped:
-            # Node da tat window van con goi tin roi; khong duoc khoi dong lai vai tro sau khi stop.
-            log_event(self.node_id, "IGNORE_AFTER_STOP", f"type=COORDINATOR from={sender_id}")
+            # Node đã tắt cửa sổ nhưng vẫn còn gói tin tới; không nhận vai trò.
+            log_event(
+                self.node_id,
+                "IGNORE_AFTER_STOP",
+                f"Bỏ qua thông báo điều phối viên từ nút {sender_id}",
+            )
             return
+
         was_coordinator = self.state == "COORDINATOR"
+
         with self._election_lock:
             self.coordinator_id = sender_id
             self.state = "IDLE"
             self._last_coordinator_seen = time.monotonic()
-        event = "STEP_DOWN" if was_coordinator else "FOLLOW_COORDINATOR"
-        log_event(self.node_id, event, f"coordinator={sender_id}")
+
+        if was_coordinator:
+            event = "STEP_DOWN"
+        else:
+            event = "FOLLOW_COORDINATOR"
+        log_event(self.node_id, event, f"Điều phối viên hiện tại: nút {sender_id}")
 
     def _on_heartbeat(self, sender_id: Optional[int], conn: ClientConnection) -> None:
-        """Node phu tra HEARTBEAT_ACK va ghi nhan coordinator con song."""
+        """Node phụ trả HEARTBEAT_ACK và ghi nhận coordinator còn sống."""
         if sender_id is None or self.state == "COORDINATOR":
             return
+
         self._last_coordinator_seen = time.monotonic()
         conn.send({"type": HEARTBEAT_ACK, "from": self.node_id, "to": sender_id})
 
     def _on_heartbeat_ack(self, sender_id: Optional[int]) -> None:
-        """Coordinator ghi nhan peer con phan hoi heartbeat."""
+        """Coordinator ghi nhận một peer còn phản hồi heartbeat."""
         if sender_id is None or self.state != "COORDINATOR":
             return
+
         self._last_heartbeat_ack[sender_id] = time.monotonic()

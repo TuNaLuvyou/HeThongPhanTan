@@ -122,7 +122,7 @@ class BullyTest(unittest.TestCase):
         self.assertFalse(mesh.nodes[1].bully.is_coordinator())
         self.assertEqual(2, mesh.nodes[1].bully.coordinator_id)
         stepped_down = [(nid, detail) for nid, _, detail in self.events("STEP_DOWN")]
-        self.assertEqual([(1, "coordinator=2")], stepped_down)
+        self.assertEqual([(1, "Điều phối viên hiện tại: nút 2")], stepped_down)
 
     def test_coordinator_survives_election_from_lower_id(self):
         """Node ID thap hon bau lai khong duoc lam phat vai tro cua coordinator dang tai."""
@@ -168,7 +168,7 @@ class BullyTest(unittest.TestCase):
         mesh.nodes[2].bully._send_heartbeats()
         alive = self.events("PEERS_ALIVE")
         self.assertEqual(1, len(alive))
-        self.assertIn("alive=[0,1]", alive[0][2])
+        self.assertIn("các nút phản hồi: [0,1]", alive[0][2])
 
     def test_silent_peer_does_not_make_coordinator_reelect(self):
         """Peer khong phan hoi chi la node offline, khong phai coordinator loi."""

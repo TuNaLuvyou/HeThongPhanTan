@@ -3,9 +3,11 @@
 ## 1. Khởi động node
 1. Đọc tham số `--id` và cấu hình từ `config.json`.
 2. Tự bind port của mình theo cấu hình.
-3. Bắt đầu bầu chọn: gửi `ELECTION` cho các node có ID lớn hơn.
+3. Trong luồng nền, thử kết nối TCP song song tới các node khác; chờ mọi lần thử hoàn tất (kể cả thất bại vì node offline), sau đó mới bật Bully và gửi `ELECTION` cho các node có ID lớn hơn. Giao diện vẫn phản hồi trong lúc kết nối và bầu chọn.
 4. Nếu không ai trả lời `ANSWER`: tự làm coordinator và gửi `COORDINATOR` cho tất cả các node.
 5. Nếu có node trả lời `ANSWER`: chờ nhận thông điệp `COORDINATOR`.
+
+Khi nhận gói tin đầu tiên có trường `from`, server lưu kết nối nhận làm đường gửi ngược nếu chưa có kết nối tới node đó. Vì vậy node đang chạy có thể gửi heartbeat/cấp quyền tới node vừa mở mà không cần khởi động lại. Nếu đóng ứng dụng khi đang kết nối hoặc bầu chọn, node không được khởi động Bully lại hay tự nhận điều phối viên sau khi đã dừng.
 
 ## 2. Bully khi coordinator lỗi
 1. Phát hiện bằng hai cách:
@@ -32,6 +34,8 @@
 5. Node gửi `RELEASE_LOCK` cho coordinator. Nếu bản thân node đang là coordinator thì tự giải phóng khoá trực tiếp (không gửi qua mạng cho chính mình).
 6. Coordinator nhận `RELEASE_LOCK`, bỏ node giữ quyền và cấp `GRANT_LOCK` cho node kế tiếp trong hàng đợi FIFO.
 7. Trường hợp node giữ quyền crash mà không gửi `RELEASE_LOCK`: code hiện chưa thu hồi khoá — các node đã nhận `LOCK_QUEUED` chờ vô hạn (CẦN CHỐT, xem TECHS mục 9c).
+
+Sau giao dịch thành công và trả khoá, nút gửi `BALANCE_CHANGED` tới các nút khác. Nút nhận đọc lại số dư từ DB trong luồng nền, rồi cập nhật giao diện qua hàng đợi. Giao dịch thất bại không gửi thông báo; các nút nhận không gửi tiếp thông báo này.
 
 > **Lưu ý cho luồng 4**: Khi demo loại trừ tương hỗ phải theo trình tự đọc, chờ, ghi giá trị đã tính; không dùng câu lệnh UPDATE nguyên tử kiểu `balance = balance + x` vì nó tự tránh mất cập nhật và làm khoá mất tác dụng khi demo.
 
