@@ -29,8 +29,8 @@ from core.network import log_event
 INITIAL_BALANCE = 10000000
 
 # Kết quả trả về của request_lock().
-LOCK_GRANTED = "GRANTED"
-LOCK_QUEUED = "QUEUED"
+GRANTED = "GRANTED"
+QUEUED = "QUEUED"
 
 
 def _database_url_from_env_file() -> Optional[str]:
@@ -93,24 +93,24 @@ class BankService:
         """Node xin quyền truy cập số dư.
 
         Trả về:
-        - LOCK_GRANTED: khoá đang rảnh (hoặc chính node này đang giữ), cấp ngay.
-        - LOCK_QUEUED : node khác đang giữ khoá, node này được xếp vào hàng đợi.
+        - GRANTED: khoá đang rảnh (hoặc chính node này đang giữ), cấp ngay.
+        - QUEUED : node khác đang giữ khoá, node này được xếp vào hàng đợi.
         """
         lock_is_free = self._lock_holder is None
         already_holds_lock = self._lock_holder == node_id
 
         if lock_is_free or already_holds_lock:
             self._lock_holder = node_id
-            log_event(node_id, "LOCK_GRANTED", f"Nút giữ quyền: {node_id}")
-            return LOCK_GRANTED
+            log_event(node_id, "GRANTED", f"Nút giữ quyền: {node_id}")
+            return GRANTED
 
         self._lock_queue.append(node_id)
         log_event(
             node_id,
-            "LOCK_QUEUED",
+            "QUEUED",
             f"Nút giữ quyền: {self._lock_holder}; hàng đợi: {self._lock_queue}",
         )
-        return LOCK_QUEUED
+        return QUEUED
 
     def release_lock(self, holder_id: int) -> Optional[int]:
         """Node đang giữ khoá trả quyền lại cho coordinator.
@@ -128,7 +128,7 @@ class BankService:
 
         next_holder = self._lock_queue.pop(0)
         self._lock_holder = next_holder
-        log_event(next_holder, "LOCK_GRANTED", f"Nút giữ quyền: {next_holder}")
+        log_event(next_holder, "GRANTED", f"Nút giữ quyền: {next_holder}")
         return next_holder
 
     def reset_lock(self) -> None:
@@ -143,7 +143,7 @@ class BankService:
 
         log_event(
             -1,
-            "LOCK_RESET",
+            "ACCESS_RESET",
             f"Nút giữ quyền cũ: {self._lock_holder}; hàng đợi cũ: {self._lock_queue}",
         )
         self._lock_holder = None

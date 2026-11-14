@@ -1,4 +1,4 @@
-"""Kiểm tra thứ tự kết nối/bầu chọn và đường gửi ngược cho node mở sau."""
+"""Kiểm tra khởi động độc lập và đường gửi ngược cho node mở sau."""
 
 import socket
 import threading
@@ -22,58 +22,43 @@ class StartupTest(unittest.TestCase):
         self.addCleanup(runtime._stop_event.set)
         return runtime
 
-    def test_all_connections_finish_before_bully_starts_without_blocking_ui(self):
+    def test_starts_without_contacting_configured_nodes(self):
         runtime = self.make_runtime()
-        entered = threading.Event()
-        release = threading.Event()
         elected = threading.Event()
-        finished = []
-        self.addCleanup(release.set)
-
-        def connect(peer_id):
-            entered.set()
-            release.wait(2)
-            finished.append(peer_id)
-            return peer_id == 2  # Node 5 offline vẫn phải hoàn tất lần thử.
-
-        runtime.server.connect_to_peer.side_effect = connect
         runtime.bully.start.side_effect = elected.set
         runtime.start()
-        self.assertTrue(entered.wait(1))
-        self.assertFalse(elected.is_set())
+        self.assertTrue(elected.wait(1))
         self.assertTrue(callable(runtime.app.on_deposit))
-        release.set()
-        self.assertTrue(elected.wait(2))
-        self.assertEqual([2, 5], sorted(finished))
+        runtime.server.connect_to_peer.assert_not_called()
+        runtime.server.join.assert_not_called()
         runtime.bully.start.assert_called_once()
 
-    def test_close_while_connecting_does_not_restart_bully(self):
+    def test_join_does_not_delay_local_election_and_shutdown_stops_retry(self):
         runtime = self.make_runtime()
+        runtime.join_address = ("127.0.0.1", 3002)
         entered = threading.Event()
         release = threading.Event()
         self.addCleanup(release.set)
 
-        def connect(peer_id):
+        def join(host, port):
+            runtime.bully.start.assert_called_once()
             entered.set()
             release.wait(2)
-            return True
+            return False
 
-        runtime.server.connect_to_peer.side_effect = connect
-        worker = threading.Thread(target=runtime._connect_peers)
-        worker.start()
+        runtime.server.join.side_effect = join
+        runtime.start()
         self.assertTrue(entered.wait(1))
         runtime.shutdown()
         release.set()
-        worker.join(2)
-        self.assertFalse(worker.is_alive())
-        runtime.bully.start.assert_not_called()
+        runtime.bully.start.assert_called_once()
         runtime.bully.stop.assert_called_once()
 
-    def test_failed_connection_does_not_abort_election(self):
+    def test_closed_node_does_not_start_services(self):
         runtime = self.make_runtime()
-        runtime.server.connect_to_peer.side_effect = OSError("Máy chưa mở")
-        runtime._connect_peers()
-        runtime.bully.start.assert_called_once()
+        runtime.shutdown()
+        runtime._start_services()
+        runtime.bully.start.assert_not_called()
 
 
 class IncomingRouteTest(unittest.TestCase):

@@ -50,6 +50,9 @@ class _ServerShim:
     def send(self, peer_id, payload):
         return self.node.send_to(peer_id, payload)
 
+    def peer_ids(self):
+        return sorted(nid for nid in self.node.mesh.nodes if nid != self.node.node_id)
+
 
 class FakeMesh:
     def __init__(self, node_ids):
@@ -69,7 +72,6 @@ class BullyTest(unittest.TestCase):
     def setUp(self):
         self.logs = []
         patches = [
-            mock.patch.object(bully_module, "load_config", lambda: {"nodes": [{"id": i} for i in (0, 1, 2)]}),
             mock.patch.object(
                 bully_module, "log_event", lambda nid, event, detail="": self.logs.append((nid, event, detail))
             ),
@@ -150,6 +152,13 @@ class BullyTest(unittest.TestCase):
         bully2.state = "ELECTING"
         bully2.handle_message(2, {"type": "ANSWER", "from": 1}, 1, FakeConn(mesh, 2, 1))
         self.assertEqual({}, bully2._election_answers)
+
+    def test_late_lower_coordinator_announcement_does_not_replace_higher_one(self):
+        mesh = FakeMesh((0, 1, 2))
+        follower = mesh.nodes[0].bully
+        follower._on_coordinator_announce(2)
+        follower._on_coordinator_announce(1)
+        self.assertEqual(2, follower.coordinator_id)
 
     def test_election_does_not_start_twice_at_once(self):
         mesh = FakeMesh((0, 1, 2))

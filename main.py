@@ -11,7 +11,7 @@ Trình tự khởi động:
     1. Đọc tham số --id và tìm cấu hình node trong config.json.
     2. Mở server TCP (bind port theo cấu hình).
     3. Mở cửa sổ Tkinter.
-    4. Kết nối tới các peer trong nền, sau đó mới bắt đầu Bully.
+    4. Bật Bully ngay; nếu có --join thì gia nhập qua địa chỉ đó trong nền.
     5. Chờ người dùng bấm Nạp/Rút.
 
 Cách chạy:
@@ -24,7 +24,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core.bank_service import BankService
 from core.bully import Bully
@@ -40,9 +39,9 @@ BULLY_MESSAGE_TYPES = (
     "HEARTBEAT_ACK",
 )
 
-# Thời gian chờ coordinator phản hồi sau khi gửi REQUEST_LOCK.
+# Thời gian chờ coordinator phản hồi sau khi gửi REQUEST.
 # Quá hạn này thì coi coordinator đã lỗi (docs/FLOWS.md mục 2b).
-LOCK_REPLY_TIMEOUT = 10.0
+REQUEST_REPLY_TIMEOUT = 10.0
 
 # Chu kỳ của vòng cập nhật trạng thái nền.
 STATUS_UPDATE_INTERVAL = 2.0
@@ -71,7 +70,7 @@ class NodeRuntime:
     Trạng thái đơn xin quyền (phía node xin quyền):
         _pending_type    : "DEPOSIT" | "WITHDRAW" | None
         _pending_amount  : số tiền của đơn đang chờ
-        _pending_sent_at : thời điểm gửi REQUEST_LOCK (time.monotonic()).
+        _pending_sent_at : thời điểm gửi REQUEST (time.monotonic()).
                            None nghĩa là coordinator đã phản hồi.
     """
 
@@ -84,6 +83,7 @@ class NodeRuntime:
         app: AppWindow,
         bank: BankService,
         bully: Bully,
+        join_address=None,
     ):
         self.root = root
         self.node_id = node_id
@@ -92,6 +92,7 @@ class NodeRuntime:
         self.app = app
         self.bank = bank
         self.bully = bully
+        self.join_address = join_address
 
         # Bảo vệ ba biến _pending_* vì chúng bị nhiều thread cùng đọc/ghi.
         self._pending_lock = threading.Lock()
@@ -110,14 +111,14 @@ class NodeRuntime:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Gắn callback, kết nối các peer rồi bật Bully trong luồng nền."""
+        """Khởi động độc lập; việc gia nhập không chặn bầu chọn hay UI."""
         self.app.on_deposit = lambda amount: self.request_transaction("DEPOSIT", amount)
         self.app.on_withdraw = lambda amount: self.request_transaction("WITHDRAW", amount)
 
         self.server.set_message_handler(self.on_message)
 
-        connect_thread = threading.Thread(target=self._connect_peers, daemon=True)
-        connect_thread.start()
+        startup_thread = threading.Thread(target=self._start_services, daemon=True)
+        startup_thread.start()
 
         periodic_thread = threading.Thread(target=self._periodic_update, daemon=True)
         periodic_thread.start()
@@ -136,31 +137,30 @@ class NodeRuntime:
 
         self.root.destroy()
 
-    def _connect_peers(self) -> None:
-        """Thử kết nối mọi peer trước khi khởi động cuộc bầu chọn đầu tiên."""
+    def _start_services(self) -> None:
+        """Chạy một mình ngay, chỉ liên hệ địa chỉ gia nhập nếu được cung cấp."""
         if self._stop_event.is_set():
             return
-        peer_ids = [int(node["id"]) for node in self.config.get("nodes", [])
-                    if int(node["id"]) != self.node_id]
-        self._ui_log("Đang kết nối các nút trước khi bầu chọn...")
-        # Thử song song để các máy offline không cộng dồn thời gian chờ.
-        with ThreadPoolExecutor(max_workers=max(1, len(peer_ids))) as pool:
-            attempts = {pool.submit(self.server.connect_to_peer, peer_id): peer_id
-                        for peer_id in peer_ids}
-            for attempt in as_completed(attempts):
-                try:
-                    attempt.result()
-                except Exception as exc:
-                    self._ui_log(f"Không kết nối được tới nút {attempts[attempt]}: {exc}")
-
-        if self._stop_event.is_set():
-            return
-        self._ui_log("Đã thử kết nối các nút, bắt đầu bầu chọn điều phối viên")
         self.bully.start()
         if self._stop_event.is_set():
             return
         self.update_status()
         self.refresh_balance_async()
+        if self.join_address is not None:
+            threading.Thread(target=self._join_cluster, daemon=True).start()
+
+    def _join_cluster(self) -> None:
+        """Thử lại một điểm gia nhập nếu máy đó chưa mở, không quét node khác."""
+        host, port = self.join_address
+        while not self._stop_event.is_set():
+            try:
+                if self.server.join(host, port):
+                    return
+            except Exception as exc:
+                self._ui_log(f"Lỗi gia nhập tại {host}:{port}: {exc}")
+            self._ui_log(f"Chưa liên hệ được {host}:{port}, sẽ thử gia nhập lại")
+            if self._stop_event.wait(5):
+                return
 
     def _periodic_update(self) -> None:
         """Vòng nền cập nhật giao diện và kiểm tra coordinator còn sống."""
@@ -234,10 +234,7 @@ class NodeRuntime:
     def _broadcast_balance_changed(self) -> None:
         """Báo các nút đọc lại DB sau khi giao dịch đã commit và trả khoá."""
         payload = {"type": "BALANCE_CHANGED", "from": self.node_id}
-        for node_config in self.config.get("nodes", []):
-            peer_id = int(node_config["id"])
-            if peer_id == self.node_id:
-                continue
+        for peer_id in self.server.peer_ids():
             try:
                 sent = self.server.send(peer_id, payload)
                 if not sent and self.server.connect_to_peer(peer_id):
@@ -268,7 +265,7 @@ class NodeRuntime:
             self._pending_sent_at = None
 
     def _check_pending_timeout(self) -> None:
-        """Phát hiện coordinator lỗi qua việc REQUEST_LOCK không được trả lời.
+        """Phát hiện coordinator lỗi qua việc REQUEST không được trả lời.
 
         Đây là cách phát hiện thứ hai trong docs/FLOWS.md mục 2b.
         """
@@ -280,20 +277,20 @@ class NodeRuntime:
             return
 
         elapsed = time.monotonic() - sent_at
-        if elapsed < LOCK_REPLY_TIMEOUT:
+        if elapsed < REQUEST_REPLY_TIMEOUT:
             return
 
         # Chỉ báo một lần cho đơn này, tránh spam log mỗi vòng cập nhật.
         self._mark_acknowledged()
         self._ui_log("Điều phối viên không phản hồi, bắt đầu bầu chọn")
-        self.bully.trigger_election("REQUEST_LOCK_NO_REPLY")
+        self.bully.trigger_election("REQUEST_NO_REPLY")
 
     # ------------------------------------------------------------------
     # Xin quyền và thực hiện giao dịch
     # ------------------------------------------------------------------
 
     def request_transaction(self, tx_type: str, amount: int) -> None:
-        """Người dùng bấm Nạp/Rút: gửi REQUEST_LOCK tới coordinator."""
+        """Người dùng bấm Nạp/Rút: gửi REQUEST tới coordinator."""
         coordinator_id = self.bully.coordinator_id
         if coordinator_id is None:
             self._ui_log("Chưa xác định điều phối viên, không thể xin quyền")
@@ -322,10 +319,10 @@ class NodeRuntime:
             self._on_lock_request(self.node_id, result)
             return
 
-        payload = {"type": "REQUEST_LOCK", "from": self.node_id}
+        payload = {"type": "REQUEST", "from": self.node_id}
         if not self.server.send(coordinator_id, payload):
             self._ui_log("Không gửi được yêu cầu xin quyền, bắt đầu bầu chọn")
-            self.bully.trigger_election("REQUEST_LOCK_SEND_FAIL")
+            self.bully.trigger_election("REQUEST_SEND_FAIL")
 
     def _on_lock_request(self, requester: int, result: str) -> None:
         """Coordinator đã quyết xong một đơn xin quyền.
@@ -343,7 +340,7 @@ class NodeRuntime:
         if requester == self.node_id:
             self._mark_acknowledged()
         else:
-            self.server.send(requester, {"type": "LOCK_QUEUED", "from": self.node_id})
+            self.server.send(requester, {"type": "QUEUED", "from": self.node_id})
 
     def _grant_to(self, requester: int) -> None:
         """Cấp quyền cho một node (có thể là chính mình)."""
@@ -351,10 +348,10 @@ class NodeRuntime:
             self._handle_grant_lock()
             return
 
-        self.server.send(requester, {"type": "GRANT_LOCK", "from": self.node_id})
+        self.server.send(requester, {"type": "GRANT", "from": self.node_id})
 
     def _handle_grant_lock(self) -> None:
-        """Nhận GRANT_LOCK: chạy giao dịch đang chờ trong thread nền."""
+        """Nhận GRANT: chạy giao dịch đang chờ trong thread nền."""
         self._mark_acknowledged()
 
         with self._pending_lock:
@@ -426,7 +423,7 @@ class NodeRuntime:
         if coordinator_id is None:
             return
 
-        payload = {"type": "RELEASE_LOCK", "from": self.node_id}
+        payload = {"type": "RELEASE", "from": self.node_id}
         if not self.server.send(coordinator_id, payload):
             self._ui_log("Không trả được quyền, điều phối viên có thể đã tắt")
 
@@ -451,15 +448,18 @@ class NodeRuntime:
         message_type = message.get("type")
         if message_type == "BALANCE_CHANGED":
             sender = message.get("from")
-            if sender != self.node_id and find_node_config(self.config, sender) is not None:
+            if sender != self.node_id and sender in self.server.peer_ids():
                 self._ui_log(f"[Số dư] Nút {sender} vừa giao dịch, đang cập nhật số dư")
                 self.refresh_balance_async()
             return
 
         was_coordinator = self.bully.is_coordinator()
 
-        if message_type in BULLY_MESSAGE_TYPES:
-            self.bully.handle_message(node_id, message, peer_id, conn)
+        if message_type in BULLY_MESSAGE_TYPES or message_type in ("JOIN", "JOIN_ACK"):
+            if message_type in ("JOIN", "JOIN_ACK"):
+                self.bully.on_peer_joined(int(peer_id))
+            else:
+                self.bully.handle_message(node_id, message, peer_id, conn)
 
             if was_coordinator and not self.bully.is_coordinator():
                 # Vừa mất vai trò coordinator: hàng đợi khoá cũ không còn
@@ -470,25 +470,25 @@ class NodeRuntime:
             self.update_status()
             return
 
-        if message_type == "REQUEST_LOCK" and self.bully.is_coordinator():
+        if message_type == "REQUEST" and self.bully.is_coordinator():
             requester = message.get("from")
             if requester is not None:
                 result = self.bank.request_lock(int(requester))
                 self._on_lock_request(int(requester), result)
             return
 
-        if message_type == "RELEASE_LOCK" and self.bully.is_coordinator():
+        if message_type == "RELEASE" and self.bully.is_coordinator():
             holder = message.get("from")
             if holder is not None:
                 next_holder = self.bank.release_lock(int(holder))
                 self._deliver_next(int(holder), next_holder)
             return
 
-        if message_type == "GRANT_LOCK":
+        if message_type == "GRANT":
             self._handle_grant_lock()
             return
 
-        if message_type == "LOCK_QUEUED":
+        if message_type == "QUEUED":
             self._mark_acknowledged()
             sender = message.get("from")
             self._ui_log(
@@ -503,8 +503,19 @@ def main() -> None:
         description="Chạy một nút trong Hệ thống Quỹ chung Phân tán"
     )
     parser.add_argument("--id", type=int, required=True, help="ID của nút (0-5)")
+    parser.add_argument("--join", metavar="IP:PORT", help="Địa chỉ một nút đang chạy để gia nhập")
     args = parser.parse_args()
     node_id = args.id
+    join_address = None
+    if args.join:
+        try:
+            join_host, join_port = args.join.rsplit(":", 1)
+            join_port = int(join_port)
+            if not join_host or not 0 < join_port < 65536:
+                raise ValueError
+            join_address = (join_host, join_port)
+        except ValueError:
+            parser.error("--join phải có dạng IP:PORT với port từ 1 đến 65535")
 
     config = load_config()
     node_config = find_node_config(config, node_id)
@@ -543,6 +554,7 @@ def main() -> None:
         app=app,
         bank=bank,
         bully=bully,
+        join_address=join_address,
     )
     runtime.start()
 

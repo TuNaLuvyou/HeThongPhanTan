@@ -12,6 +12,9 @@
 - Mọi node chạy cùng một mã nguồn, khác nhau ở tham số `--id`.
 - Mỗi node vừa là server (lắng nghe) vừa là client (gửi).
 - Coordinator không giữ số dư; số dư nằm trong DB, coordinator chỉ cấp quyền truy cập (phương pháp cấp quyền sử dụng).
+- `core/network.py` vận chuyển JSON qua TCP, quản lý kết nối và trao thông tin thành viên. Dùng được qua LAN hoặc mạng ảo ZeroTier khi các máy truy cập được IP và port của nhau.
+- `core/bully.py` quyết định bầu chọn và vai trò coordinator; `core/bank_service.py` giữ người đang có quyền và hàng đợi FIFO; `main.py` ghép các luồng và xử lý thông điệp.
+- Khi nhóm kết nối thông suốt và bầu chọn ổn định, node ID lớn nhất còn hoạt động trong nhóm làm coordinator. Chưa có cơ chế bảo đảm một coordinator duy nhất giữa các nhóm chưa kết nối hoặc bị chia cắt.
 
 ## 3. Module và người phụ trách
 - `core/network.py`: Thành viên 3 (Linux 1)
@@ -21,16 +24,18 @@
 - `main.py`: Trưởng nhóm (macOS ARM)
 
 ## 4. Cấu hình
-- `config.json` liệt kê 6 node (`id`, `ip`, `port`, `os`).
+- `config.json` chứa cấu hình khởi động (`id`, `ip`, `port`, `os`); mỗi máy chỉ cần mục của chính ID mình. Các mục khác nếu có không được coi là thành viên đang tham gia.
 - Port của node = giá trị trong config theo `--id`, tự bind khi khởi động.
 - Bind port thất bại (port đã bị chiếm hoặc IP trong `config.json` không phải IP máy đang chạy) thì `start_node()` trả `None` và node thoát ngay kèm thông báo lỗi; không mở giao diện chạy mà không có kết nối.
-- Sau khi đăng ký handler và mở UI, node thử kết nối các peer song song trong nền; chỉ khởi động Bully sau khi các lần thử hoàn tất. Peer offline không ngăn node bầu chọn và không cộng dồn thời gian chờ kết nối.
+- Sau khi đăng ký handler và mở UI, node bật Bully ngay. Khi chưa phát hiện thành viên nào thì tự làm coordinator ngay. Không kiểm tra danh sách cấu hình và không chờ đủ máy.
+- Tham số tuỳ chọn `--join IP:PORT` chỉ định một thành viên bất kỳ để gia nhập. `JOIN`/`JOIN_ACK` trao địa chỉ, hình thành danh sách thành viên trong bộ nhớ và kết nối tới các thành viên được giới thiệu. Không có `--join` thì tạo nhóm riêng. Điểm gia nhập chưa sẵn sàng được thử lại mỗi 5 giây trong nền.
+- `NetworkServer.peer_ids()` cung cấp ID đã phát hiện; `join(host, port)` gia nhập; `send()` tự kết nối lại tới địa chỉ thành viên đã biết khi cần gửi. Không suy ID từ IP. IP tự công bố phải là địa chỉ các máy khác truy cập được (IP ZeroTier khi chạy nhiều máy).
 - Kết nối nhận được định danh bằng `from` cũng được dùng làm đường gửi ngược nếu chưa có đường gửi tới peer, hỗ trợ node tham gia sau khi coordinator đã chạy.
 
 ## 5. Giao thức
 - Mỗi gói tin là một chuỗi JSON trên một dòng, kết thúc bằng `\n`.
 - Mọi gói tin có trường `type` và `from` (ID node gửi).
-- `from` là căn cứ định danh node gửi ở tầng mạng: node nhận lấy `from` của gói tin, không suy ID người gửi từ IP kết nối (nhiều node chạy chung một máy thì trùng IP; suy từ IP chỉ còn dùng để ghi log).
+- `from` là căn cứ định danh node gửi ở tầng mạng: không suy ID từ IP kết nối, kể cả để ghi log. Nhiều node chạy chung một máy có thể có cùng IP. Trường này chưa phải cơ chế xác thực người gửi.
 
 ## 6. Các loại gói tin
 - `ELECTION`
@@ -38,26 +43,29 @@
 - `COORDINATOR`
 - `HEARTBEAT`
 - `HEARTBEAT_ACK`
-- `REQUEST_LOCK`
-- `GRANT_LOCK`
-- `LOCK_QUEUED`
-- `RELEASE_LOCK`
+- `JOIN`, `JOIN_ACK`: khai báo/gia nhập và giới thiệu thành viên.
+- `REQUEST`
+- `GRANT`
+- `QUEUED`
+- `RELEASE`
 - `BALANCE_CHANGED`: nút vừa giao dịch thành công gửi trực tiếp tới các nút khác để cập nhật số dư giao diện.
-- `LOCK_QUEUED` là loại mới so với danh sách đã chốt ở mục 8: coordinator trả cho node vừa bị đưa vào hàng đợi FIFO ("đã nhận đơn, đang xếp hàng"), để node xin quyền phân biệt "đang chờ tới lượt" với "coordinator đã chết" (FLOWS mục 2b). `GRANT_LOCK` và `LOCK_QUEUED` đều được tính là "coordinator có phản hồi".
-- **Cấu trúc trường của từng loại** (đang ở trạng thái CẦN CHỐT — xem 9a): bảng dưới đây là đề xuất theo đúng code đang phát, cần cả nhóm họp xác nhận chứ chưa chốt một mình.
+- Ba loại thông điệp bầu chọn là `ELECTION`, `ANSWER`, `COORDINATOR`. `ANSWER` tương đương `OK` trong mô tả Bully thường gặp; code dùng tên `ANSWER`. `HEARTBEAT` và `HEARTBEAT_ACK` phục vụ theo dõi hoạt động.
+- Coordinator trả `QUEUED` cho node vừa vào FIFO để phân biệt đang xếp hàng với không được phản hồi. `GRANT` và `QUEUED` đều dừng đồng hồ chờ phản hồi của đơn xin quyền.
+- Tên thông điệp cấp quyền hiện dùng `REQUEST`, `GRANT`, `RELEASE`, `QUEUED` theo yêu cầu đổi tên. Bảng dưới ghi cấu trúc đang được code gửi; việc duyệt đầy đủ cấu trúc trường của nhóm vẫn nằm ở mục 9a.
 
 | `type` | Cấu trúc gói tin | Ai gửi → ai |
 |---|---|---|
+| `JOIN` / `JOIN_ACK` | `{"type": "JOIN", "from": 2, "node": {"id": 2, "ip": "10.130.28.199", "port": 3002}, "peers": [{"id": 0, "ip": "10.130.28.217", "port": 3000}]}` | Node kết nối → thành viên đang chạy; bên nhận trả cùng cấu trúc với type `JOIN_ACK`, địa chỉ của mình và các thành viên đã biết |
 | `ELECTION` | `{"type": "ELECTION", "from": 2}` | Node bắt đầu bầu cử → các node có ID lớn hơn |
 | `ANSWER` | `{"type": "ANSWER", "from": 4, "to": 2}` | Chỉ node có ID lớn hơn node khởi động bầu cử → node khởi động |
 | `COORDINATOR` | `{"type": "COORDINATOR", "from": 4}` | Node thắng cử broadcast cho tất cả; coordinator đang tại vị cũng trả riêng cho node ID nhỏ hơn khi nhận `ELECTION` (FLOWS mục 2) |
 | `HEARTBEAT` | `{"type": "HEARTBEAT", "from": 4}` | Coordinator → từng peer, mỗi `HEARTBEAT_INTERVAL` |
 | `HEARTBEAT_ACK` | `{"type": "HEARTBEAT_ACK", "from": 2, "to": 4}` | Peer (không phải coordinator) → coordinator |
-| `REQUEST_LOCK` | `{"type": "REQUEST_LOCK", "from": 2}` | Node có giao dịch → coordinator |
-| `GRANT_LOCK` | `{"type": "GRANT_LOCK", "from": 4}` | Coordinator → node được cấp quyền |
-| `LOCK_QUEUED` | `{"type": "LOCK_QUEUED", "from": 4}` | Coordinator → node vừa được đưa vào hàng đợi FIFO |
-| `RELEASE_LOCK` | `{"type": "RELEASE_LOCK", "from": 2}` | Node đang giữ quyền → coordinator |
-| `BALANCE_CHANGED` | `{"type": "BALANCE_CHANGED", "from": 2}` | Nút vừa commit giao dịch thành công → các nút khác trong cấu hình |
+| `REQUEST` | `{"type": "REQUEST", "from": 2}` | Node có giao dịch → coordinator |
+| `GRANT` | `{"type": "GRANT", "from": 4}` | Coordinator → node được cấp quyền |
+| `QUEUED` | `{"type": "QUEUED", "from": 4}` | Coordinator → node vừa được đưa vào hàng đợi FIFO |
+| `RELEASE` | `{"type": "RELEASE", "from": 2}` | Node đang giữ quyền → coordinator |
+| `BALANCE_CHANGED` | `{"type": "BALANCE_CHANGED", "from": 2}` | Nút vừa commit giao dịch thành công → các thành viên đã phát hiện |
 
 ### Đồng bộ số dư giao diện
 - Chỉ gửi `BALANCE_CHANGED` sau khi giao dịch thành công và đã trả khoá; giao dịch bị từ chối hoặc phát sinh lỗi không gửi thông báo.
@@ -68,11 +76,18 @@
 - Nội dung log và nhãn giao diện sử dụng tiếng Việt có dấu; mã gói tin, mã sự kiện nội bộ và tên cột DB giữ nguyên.
 - Đây là thông báo qua TCP của ứng dụng, không sử dụng Supabase Realtime hay Socket.IO. Các node cần chạy cùng bản mã nguồn để xử lý thông báo mới.
 
-## 7. CSDL (đề xuất lược đồ)
+### Trạng thái cấp quyền tập trung
+
+- `BankService._lock_holder`: `None` là rảnh, có ID là đang bận và chỉ rõ node giữ quyền; tương đương vai trò biến `busy`, không có một biến `busy` riêng.
+- `BankService._lock_queue`: danh sách chờ FIFO, lấy phần tử đầu khi người giữ quyền gửi `RELEASE`.
+- Giao dịch lỗi vẫn đi qua `finally` để trả quyền. `RELEASE` từ node không giữ quyền bị bỏ qua. Nhận `GRANT` khi không còn giao dịch chờ thì trả quyền ngay.
+- Chưa có lease, chống yêu cầu trùng hoặc kiểm tra đầy đủ người gửi `GRANT`/`QUEUED`. Phần đổi tên thông điệp chưa bổ sung các cơ chế chịu lỗi này.
+
+## 7. CSDL hiện tại
 - Bảng `fund` (`id`, `balance bigint`, `updated_at`): có một dòng duy nhất.
 - Bảng `transactions` (`id`, `node_id`, `type` DEPOSIT/WITHDRAW, `amount`, `created_at`).
 - Kết nối qua Supabase Shared pooler chế độ session (cổng 5432) vì mạng nhà có thể chỉ có IPv4.
-- Project free của Supabase bị tạm dừng sau khoảng 7 ngày không hoạt động, cần kiểm tra trước buổi demo.
+- Kiểm tra DB đang hoạt động và kết nối được trước buổi demo.
 - Chuỗi kết nối lưu trong `.env`, không commit.
 - `BankService(database_url=...)` ưu tiên chuỗi được truyền trực tiếp, sau đó tới biến môi trường `DATABASE_URL`, cuối cùng đọc `DATABASE_URL` trong `.env` ở gốc dự án. Không cần thư viện dotenv.
 
@@ -82,6 +97,7 @@
 - Bố cục gồm số dư, vai trò/điều phối viên, nhập số tiền và nhật ký. Thời điểm cập nhật số dư là lúc giao diện nhận kết quả đọc DB, không phải thời gian commit giao dịch.
 - Luồng nền chỉ gửi sự kiện qua `post_event()`; Tkinter xử lý hàng đợi ở luồng chính.
 - Nhật ký giao diện có giờ và màu theo thông báo. Log file `logs/node_<id>.log` lưu UTF-8, log terminal dùng UTF-8 để tránh lỗi mã hoá tiếng Việt trên Windows.
+- Thư mục `logs/` và file log được tự tạo khi có sự kiện; không cần giữ trong cây mã nguồn. Cache `__pycache__/` do Python tự tạo. Cả cache, log và môi trường `venv/` được bỏ qua trong Git.
 - Hướng dẫn và giới hạn kiểm thử nằm trong [TESTING.md](TESTING.md).
 
 ## 8. ĐÃ CHỐT
@@ -91,20 +107,22 @@
 - JSON phân tách bằng `\n`.
 - Bully với `ELECTION` / `ANSWER` / `COORDINATOR` + heartbeat.
 - ID lớn hơn thắng.
-- Khoá tập trung tại coordinator (`REQUEST_LOCK` / `GRANT_LOCK` / `RELEASE_LOCK`).
+- Khởi động độc lập; gia nhập qua một địa chỉ `--join`, trao ID và địa chỉ bằng `JOIN`/`JOIN_ACK`, không quét danh sách node trước khi chạy (chốt theo yêu cầu người dùng).
+- Khoá tập trung tại coordinator (`REQUEST` / `GRANT` / `RELEASE`).
+- Tên thông điệp cấp quyền đã bỏ hậu tố/tiền tố `LOCK`; phản hồi xếp hàng là `QUEUED`.
 - Số dư trong DB Supabase.
 
 ## 9. CẦN CHỐT (sau khi các thành viên báo cáo)
-- **a.** Cấu trúc trường JSON của từng loại gói tin: code đã có đáp án, bảng đề xuất ở mục 6. Cần cả nhóm xác nhận để chuyển thành ĐÃ CHỐT, đồng thời sửa dòng "Khoá tập trung tại coordinator (`REQUEST_LOCK` / `GRANT_LOCK` / `RELEASE_LOCK`)" ở mục 8 thành có thêm `LOCK_QUEUED`.
+- **a.** Duyệt đầy đủ cấu trúc trường JSON theo bảng code hiện tại ở mục 6. Tên thông điệp đã được đổi theo yêu cầu; trạng thái này không có nghĩa đã bổ sung xử lý yêu cầu trùng, mất thông điệp hoặc phân mảnh mạng.
 - **b.** Tham số thời gian: CẦN CHỐT. Code hiện đang dùng (đơn vị giây):
-  - `ELECTION_ANSWER_TIMEOUT = 5.0` (`core/bully.py`) — chờ `ANSWER` khi bầu cử.
+  - `ELECTION_ANSWER_TIMEOUT = 5.0` (`core/bully.py`) — chờ `ANSWER` khi có thành viên ID cao hơn; không có thì tự làm coordinator ngay.
   - `HEARTBEAT_INTERVAL = 2.0` (`core/bully.py`) — chu kỳ coordinator gửi `HEARTBEAT` và chu kỳ vòng canh kiểm tra.
   - `HEARTBEAT_TIMEOUT = 3.0` (`core/bully.py`) — peer không trả `HEARTBEAT_ACK` quá ngần này bị coi là offline (chỉ để ghi log, không kích hoạt bầu cử).
   - `COORDINATOR_SILENCE_TIMEOUT = 6.0` (`core/bully.py`) — node phụ phát hiện coordinator im lặng, bầu lại (FLOWS mục 2a).
-  - `LOCK_REPLY_TIMEOUT = 10.0` (`main.py`) — chờ `GRANT_LOCK`/`LOCK_QUEUED` sau khi gửi `REQUEST_LOCK`; quá hạn thì bầu lại (FLOWS mục 2b).
+  - `REQUEST_REPLY_TIMEOUT = 10.0` (`main.py`) — chờ `GRANT`/`QUEUED` sau khi gửi `REQUEST`; quá hạn thì bầu lại (FLOWS mục 2b).
   - Đề xuất: chốt nguyên các giá trị trên nếu cả nhóm đồng ý; phương án khác: nới `COORDINATOR_SILENCE_TIMEOUT` ≥ 3 lần `HEARTBEAT_INTERVAL` để dung sai mạng ZeroTier.
-- **c.** Xử lý khi node đang giữ quyền bị crash: CẦN CHỐT. Code hiện chưa xử lý — coordinator giữ nguyên `_lock_holder` cho tới khi có `RELEASE_LOCK`; các node khác nhận `LOCK_QUEUED` và chờ vô hạn (coordinator vẫn sống nên không kích hoạt bầu lại). Đề xuất cũ vẫn hợp thời gian: quyền có thời hạn (lease), coordinator thu hồi khi quá hạn; phương án khác: coordinator phát `GRANT_LOCK` lại cho node kế tiếp sau `LOCK_REPLY_TIMEOUT` mà không thấy `RELEASE_LOCK`.
-- **d.** Xử lý khi đổi coordinator giữa chừng: CẦN CHỐT phần còn lại. Code hiện đã làm: coordinator cũ xoá holder + hàng đợi FIFO khi hạ vai trò (`BankService.reset_lock()`, log `LOCK_RESET`), coordinator mới bắt đầu với hàng đợi trống; node đang chờ mà phát hiện đổi coordinator thì đơn xin bị huỷ và báo người dùng bấm lại (`main.py::NodeRuntime.update_status`). Còn bỏ ngỏ: code KHÔNG tự động gửi lại `REQUEST_LOCK` như đề xuất cũ của mục này — cần chốt giữa "huỷ + báo bấm lại" (đang dùng) với "tự gửi lại" (đề xuất cũ).
+- **c.** Xử lý khi node đang giữ quyền bị crash: CHƯA TRIỂN KHAI. Coordinator giữ nguyên `_lock_holder` cho tới khi có `RELEASE`; node đã nhận `QUEUED` có thể chờ vô hạn. Phương án cần thiết kế là lease kết hợp cơ chế ngăn người giữ quyền cũ tiếp tục ghi sau khi hết quyền. Chỉ cấp tiếp sau timeout không đủ bảo đảm an toàn nếu người giữ quyền cũ vẫn đang chạy.
+- **d.** Xử lý khi đổi coordinator giữa chừng: CẦN CHỐT phần còn lại. Code hiện đã làm: coordinator cũ xoá holder + hàng đợi FIFO khi hạ vai trò (`BankService.reset_lock()`, log `ACCESS_RESET`), coordinator mới bắt đầu với hàng đợi trống; node đang chờ mà phát hiện đổi coordinator thì đơn xin bị huỷ và báo người dùng bấm lại (`main.py::NodeRuntime.update_status`). Còn bỏ ngỏ: code KHÔNG tự động gửi lại `REQUEST` như đề xuất cũ của mục này — cần chốt giữa "huỷ + báo bấm lại" (đang dùng) với "tự gửi lại" (đề xuất cũ).
 - **e.** Có thêm kiểm tra phiên bản (version) khi ghi DB làm lớp bảo vệ phụ hay không.
 - **f.** Driver DB (psycopg2-binary hay psycopg 3) và có tách file `core/db.py` hay không. (Ghi nhận: code hiện dùng `psycopg2`.)
 - **g.** Chức năng demo bổ sung: công tắc "tắt khoá" (minh hoạ mất cập nhật), nút giả lập crash, độ trễ mô phỏng xử lý khi nạp/rút.
