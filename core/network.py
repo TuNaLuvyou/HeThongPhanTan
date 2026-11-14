@@ -137,7 +137,7 @@ class NetworkServer:
         Handler se duoc goi voi (node_id, message, peer_id, conn):
         - node_id: ID node hien tai (nguoi nhan).
         - message: JSON message da nhan duoc.
-        - peer_id: ID peer gui message (None neu khong xac dinh duoc).
+        - peer_id: ID node gui (lay tu truong `from`, None neu goi tin khong co `from`).
         - conn: ClientConnection su dung.
         """
         self._handler = handler
@@ -214,18 +214,33 @@ class NetworkServer:
             threading.Thread(target=self._listen_loop, args=(peer_id, conn), daemon=True).start()
 
     def _resolve_peer_id(self, addr: tuple) -> Optional[int]:
-        """Xac dinh ID peer gom IP cua endpoint nhan."""
+        """Nhan dien peer theo IP nguoi gui, chi dung cho ghi log.
+
+        Khong the dung day de dinh danh node gui: khi nhieu node chay chung mot may thi
+        IP giong nhau, con port nguoi gui la port ngau nhien cua OS (khong phai port cua
+        node do). Dinh danh that su phai lay tu truong `from` cua goi tin (TECHS muc 5).
+        """
         for node in load_config().get("nodes", []):
             if node.get("ip") == addr[0]:
                 return int(node.get("id"))
         return None
 
     def _listen_loop(self, peer_id: Optional[int], conn: ClientConnection) -> None:
-        """Vong lang nghe cua mot connection, dispatch message cho handler."""
+        """Vong lang nghe cua mot connection, dispatch message cho handler.
+
+        peer_id gui cho handler lay theo truong `from` cua goi tin (dinh danh that cua node
+        gui); chi khi goi tin khong co `from` moi dung den nhan dien suy ra tu IP.
+        """
         while self._running:
             message = conn.receive()
             if message is None:
                 break
+            sender_id = message.get("from")
+            if sender_id is not None:
+                try:
+                    peer_id = int(sender_id)
+                except (TypeError, ValueError):
+                    pass
             if self._handler is not None:
                 try:
                     self._handler(self.node_id, message, peer_id, conn)
@@ -233,12 +248,18 @@ class NetworkServer:
                     log_event(self.node_id, "HANDLER_ERROR", str(exc))
 
 
-def start_node(node_id: int) -> NetworkServer:
-    """Tao NetworkServer cua mot node: bind port tu config theo --id."""
+def start_node(node_id: int) -> Optional[NetworkServer]:
+    """Tao NetworkServer cua mot node: bind port tu config theo --id.
+
+    Tra ve None neu bind that bai (port da bi chiem, hoac IP trong config khong phai
+    cua may nay). Nguoi goi phai dung lai, neu khong node se mo UI ma khong nghe duoc
+    ket noi nao va khong ai phat hien ra.
+    """
     host = get_host_by_id(node_id)
     port = get_port_by_id(node_id)
     server = NetworkServer(node_id=node_id, host=host, port=port)
-    ok = server.start()
-    if ok:
-        log_event(node_id, "NODE_READY", f"host={host} port={port}")
+    if not server.start():
+        log_event(node_id, "NODE_START_FAILED", f"host={host} port={port}")
+        return None
+    log_event(node_id, "NODE_READY", f"host={host} port={port}")
     return server
